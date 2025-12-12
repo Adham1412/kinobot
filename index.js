@@ -2,7 +2,7 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const mongoose = require('mongoose');
 const express = require('express');
-
+ 
 // --- SOZLAMALAR ---
 const token = process.env.BOT_TOKEN;
 const adminId = parseInt(process.env.ADMIN_ID);
@@ -347,4 +347,5 @@ bot.on('callback_query', async (query) => {
     if (data === 'cancel_del' && chatId === adminId) {
         bot.deleteMessage(chatId, query.message.message_id);
     }
+
 });
