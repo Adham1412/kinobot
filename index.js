@@ -276,8 +276,14 @@ bot.on('message', (msg) => {
         }
 
         const state = adminState.get(chatId);
+        const adminCmds = ['/start', '/panel', '🎬 Kino Yuklash', "🗑 Kino O'chirish", '📊 Statistika', '📢 Reklama Tarqatish', '📢 Kanallar Sozlamasi'];
+        const isAdminCmd = text && adminCmds.includes(String(text).trim());
 
-        if (state) {
+        // Admin kutish holatida (video/kod/reklama kutayotganda) boshqa panel tugmasini bossa —
+        // tugma matnini kutilayotgan xabar sifatida qabul qilmaymiz, o'sha tugma vazifasiga o'tamiz.
+        if (state && isAdminCmd) adminState.delete(chatId);
+
+        if (state && !isAdminCmd) {
             if (state.step === 'await_video') {
                 if (video) {
                     adminState.set(chatId, { step: 'await_code', fileId: video.file_id, caption: msg.caption || 'Kino' });
@@ -435,6 +441,9 @@ bot.on('callback_query', (query) => {
     (async () => {
     const chatId = query.message.chat.id;
     const data = query.data;
+
+    // Admin har qanday tugma bossa — kutilayotgan matn holati bekor, tugma o'z vazifasini bajaradi
+    if (chatId === adminId) adminState.delete(chatId);
 
     // ✅ Tekshirish — hammasini tekshiradi
     if (data === 'check_sub') {
