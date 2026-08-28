@@ -167,43 +167,31 @@ async function sendMovie(chatId, movieId) {
         });
         return true;
     } catch (e) {
-        // Fayl kanalda hali bormi — yo'q bo'lsa bazadan avto o'chiramiz
-        let alive = false;
+        // Kino yuborilmadi. Fayl CHINDAKAM o'chirilganligi aniq bo'lsa — bazadan o'chiramiz.
+        // Aks holda (katta fayl, flood va h.k.) kino O'CHIRILMAYDI, faqat xato xabar yuboriladi.
+        let deleted = false;
         if (upd) {
-            try { await bot.getFile(upd.fileId); alive = true; } catch (e2) {}
+            try {
+                await bot.getFile(upd.fileId);
+            } catch (e2) {
+                const m = (e2.message || '').toLowerCase();
+                deleted = !m.includes('too big') && !m.includes('flood');
+            }
         }
-        if (upd && !alive) {
+        if (upd && deleted) {
             await cleanupMovie(upd._id);
             bot.sendMessage(chatId, '❌ Bu kod bekor qilingan');
         } else {
-            bot.sendMessage(chatId, '❌ Kino uzilmadi');
+            bot.sendMessage(chatId, '❌ Kino uzilmayapti');
         }
         return false;
     }
 }
 
-// --- KANALDA YO'QOLGAN KINOLARNI AVTO-SKANER QILISH (kanaldan o'chirilganlar bazadan ham o'chiriladi) ---
-let scanningStale = false;
-async function scanStaleMovies() {
-    if (scanningStale) return;
-    if (mongoose.connection.readyState !== 1) return;
-    scanningStale = true;
-    try {
-        const movies = await Movie.find();
-        for (const mv of movies) {
-            try {
-                await bot.getFile(mv.fileId);
-            } catch (e) {
-                console.log('Kanalda yo\'q, bazadan o\'chirilmoqda:', mv.code);
-                await cleanupMovie(mv._id);
-            }
-            await new Promise(r => setTimeout(r, 250));
-        }
-    } finally {
-        scanningStale = false;
-    }
-}
-setInterval(scanStaleMovies, 10 * 60 * 1000);
+// --- KANALDA YO'QOLGAN KINOLARNI AVTO-SKANER QILISH O'CHIRILDI ---
+// Eslatma: getFile tekshiruvi katta/uzoq saqlanadigan video uchun xato qaytarishi
+// mumkin, bu esa to'g'ri kinolarni bazadan o'chirib yuborardi. Shu uchun olib tashlandi.
+// Endi kino bazadan faqat admin qo'lda (admin panel) yoki sendVideo aniq xato bersa chiqariladi.
 
 async function finishSubscription(chatId, msgId, queryId) {
     try { if (queryId) await bot.answerCallbackQuery(queryId, { text: '✅' }); } catch (e) {}
