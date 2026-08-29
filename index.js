@@ -488,3 +488,376 @@ bot.on('callback_query', (query) => {
     }
     })().catch(e => console.error('Callback xato:', e && e.message));
 });
+
+// ====================================================================
+// TOPShIRIQ BOT — BIRGA ISHLAYDI ("Guruhda N ta a'zo qo'sh — yozishing o'chirilmaydi")
+// ====================================================================
+const tgToken = process.env.TOPSHIRIQ_TOKEN;
+
+if (tgToken) {
+    const topshiriqBot = new TelegramBot(tgToken, {
+        polling: { params: { allowed_updates: ['message', 'callback_query', 'chat_member'] } }
+    });
+    topshiriqBot.on('polling_error', (e) => console.error('Topshiriq polling:', e && e.message));
+
+    // MODELLAR (MongoDB)
+    const TgGroup = mongoose.model('TgGroup', new mongoose.Schema({
+        telegramGroupId: { type: Number, unique: true },
+        title: String,
+        isActive: { type: Boolean, default: true },
+        requiredAdds: { type: Number, default: 3 }
+    }));
+    const TgUserSchema = new mongoose.Schema({
+        telegramUserId: Number,
+        groupId: Number,
+        currentAdds: { type: Number, default: 0 },
+        requiredAdds: Number
+    });
+    TgUserSchema.index({ telegramUserId: 1, groupId: 1 }, { unique: true });
+    const TgUser = mongoose.model('TgUser', TgUserSchema);
+    const TgAddedMember = mongoose.model('TgAddedMember', new mongoose.Schema({
+        adderId: Number,
+        addedUserId: Number,
+        groupId: Number,
+        status: { type: String, default: 'ACTIVE' }
+    }));
+    const TgScheduledDeletionSchema = new mongoose.Schema({
+        chatId: Number,
+        messageId: Number,
+        deleteAt: Date
+    });
+    TgScheduledDeletionSchema.index({ chatId: 1, messageId: 1 }, { unique: true });
+    TgScheduledDeletionSchema.index({ deleteAt: 1 });
+    const TgScheduledDeletion = mongoose.model('TgScheduledDeletion', TgScheduledDeletionSchema);
+
+    // --- YORDAMCHILAR ---
+    const tgRetryAfter = (err) => {
+        const s = (err && err.message) || '';
+        const m = s.match(/retry after (\d+)/i);
+        return m ? parseInt(m[1], 10) : 0;
+    };
+    const tgSleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    const tgAdminCache = new Map();
+    async function tgIsAdmin(chatId, userId) {
+        const key = `${chatId}:${userId}`;
+        const c = tgAdminCache.get(key);
+        if (c && c.expires > Date.now()) return c.isAdmin;
+        const check = async () => {
+            const member = await topshiriqBot.getChatMember(chatId, userId);
+            const ok = member.status === 'creator' || member.status === 'administrator';
+            tgAdminCache.set(key, { isAdmin: ok, expires: Date.now() + 5 * 60 * 1000 });
+            return ok;
+        };
+        try {
+            return await check();
+        } catch (err) {
+            const rt = tgRetryAfter(err);
+            if (rt) { await tgSleep(rt * 1000); try { return await check(); } catch (e2) { return false; } }
+            return false;
+        }
+    }
+
+    // --- 20s AVTO-O'CHIRISH XIZMATI ---
+    const tgDeleteTimers = new Map();
+    async function tgDoDelete(chatId, messageId) {
+        try { await topshiriqBot.deleteMessage(chatId, messageId); } catch (e) {}
+        try { await TgScheduledDeletion.deleteMany({ chatId, messageId }); } catch (e) {}
+    }
+    function tgScheduleDeletion(chatId, messageId, deleteAtMs) {
+        const key = `${chatId}:${messageId}`;
+        const delay = deleteAtMs - Date.now();
+        if (delay <= 0) { tgDoDelete(chatId, messageId); return; }
+        const timer = setTimeout(async () => {
+            tgDeleteTimers.delete(key);
+            await tgDoDelete(chatId, messageId);
+        }, delay);
+        tgDeleteTimers.set(key, timer);
+    }
+    async function tgRecoverDeletions() {
+        if (mongoose.connection.readyState !== 1) return;
+        try {
+            const now = new Date();
+            const expired = await TgScheduledDeletion.find({ deleteAt: { $lte: now } });
+            for (const en of expired) tgDoDelete(en.chatId, en.messageId);
+            const pending = await TgScheduledDeletion.find({ deleteAt: { $gt: now } });
+            for (const en of pending) tgScheduleDeletion(en.chatId, en.messageId, en.deleteAt.getTime());
+            console.log('Topshiriq recovery:', expired.length, 'muddati o\'tgan,', pending.length, 'kutilayotgan');
+        } catch (e) { console.error('Topshiriq recovery xato:', e && e.message); }
+    }
+    setInterval(async () => {
+        if (mongoose.connection.readyState !== 1) return;
+        try {
+            const expired = await TgScheduledDeletion.find({ deleteAt: { $lte: new Date() } });
+            for (const en of expired) tgDoDelete(en.chatId, en.messageId);
+        } catch (e) {}
+    }, 5000);
+
+    // --- IDEMPOTENTLIK ---
+    const tgProcessed = new Set();
+    setInterval(() => { if (tgProcessed.size > 10000) tgProcessed.clear(); }, 60000);
+
+    // --- `/admin` PANELI ---
+    const TG_OPTIONS = [1, 2, 3, 5, 10];
+    const tgAdminSessions = new Map();
+    function tgBuildKeyboard(requiredAdds) {
+        const rows = [];
+        rows.push([{ text: "➕ A'zo qo'shish", callback_data: 'admin_add_member' }]);
+        let row = [];
+        for (let i = 0; i < TG_OPTIONS.length; i++) {
+            const n = TG_OPTIONS[i];
+            row.push({ text: n === requiredAdds ? `✅ ${n}` : `${n}`, callback_data: `admin_set_${n}` });
+            if (i % 2 === 1) { rows.push(row); row = []; }
+        }
+        if (row.length) rows.push(row);
+        return { inline_keyboard: rows };
+    }
+    function tgPanelText(n) {
+        return `🔧 <b>Admin Panel</b>\n\n📌 Hozirgi kerakli son: <b>${n}</b> ta a'zo\n\n👉 Pastdagi tugmalardan tanlang:`;
+    }
+    const TG_MEMBER_GUIDE = `📖 <b>A'zo qo'shish yo'riqnomasi</b>\n\n1️⃣ Guruhni oching\n2️⃣ Yuqoridagi <b>▾ sarlavha</b> yoki guruh nomi yonidagi belgini bosing\n3️⃣ <b>Add Members</b> yoki <b>➕</b> tugmasini tanlang\n4️⃣ Kontaktlaringizni belgilab <b>qo'shish</b> tugmasini bosing\n\nBajarilgach hisobingiz avtomatik yangilanadi. 🎉\n\n⚠️ <i>Siz qo'shgan a'zo guruhdan chiqib ketsa, sizning hisobingizdan ayriladi.</i>`;
+    const TG_ADMIN_GUIDE = `📖 <b>A'zo qo'shish yo'riqnomasi</b>\n\n1️⃣ Guruhni oching\n2️⃣ Yuqoridan (sarlavha yonidagi) <b>➕</b> yoki <b>🗣 A'zolar</b> tugmasini bosing\n3️⃣ <b>Add Members</b> ni tanlang\n4️⃣ Kontaktlarni belgilab qo'shing\n\nBajarilgach, a'zolaringiz soni avtomatik hisoblanadi. 🎉`;
+
+    async function tgUpsertGroup(chatId, title) {
+        return TgGroup.findOneAndUpdate(
+            { telegramGroupId: chatId },
+            { $set: { title: title || 'Unknown' }, $setOnInsert: { requiredAdds: 3, isActive: true } },
+            { new: true, upsert: true, setDefaultsOnInsert: true }
+        );
+    }
+    async function tgEnsureUser(telegramUserId, groupId, requiredAdds) {
+        const existing = await TgUser.findOne({ telegramUserId, groupId });
+        if (!existing) {
+            await TgUser.create({ telegramUserId, groupId, currentAdds: 0, requiredAdds });
+        }
+    }
+    async function tgSendReadyMessage(chatId, userId) {
+        try {
+            const member = await topshiriqBot.getChatMember(chatId, userId);
+            const name = (member.user && member.user.first_name) || '';
+            const sent = await topshiriqBot.sendMessage(
+                chatId,
+                `🎉 Xayrli kun, ${name}!\n\n✅ Siz kerakli a'zolarni qo'shdiz!\n✍️ Endi guruhda <b>bemalol yozishingiz</b> mumkin.\n\n👏 Tabriklaymiz, endi kun tartibi siz tomonda! 🚀`,
+                { parse_mode: 'HTML' }
+            );
+            const deleteAt = Date.now() + 20000;
+            try { await TgScheduledDeletion.create({ chatId, messageId: sent.message_id, deleteAt: new Date(deleteAt) }); } catch (e) {}
+            tgScheduleDeletion(chatId, sent.message_id, deleteAt);
+        } catch (e) {
+            const rt = tgRetryAfter(e);
+            if (rt) { await tgSleep(rt * 1000); tgSendReadyMessage(chatId, userId); return; }
+            console.error('Topshiriq tabrik xato:', e && e.message);
+        }
+    }
+
+    // --- XABAR (guruh) ---
+    const tgNotifMap = new Map();
+    async function tgHandleMessage(msg) {
+        try {
+            if (!msg || !msg.chat) return;
+            const ct = msg.chat.type;
+            if (ct !== 'supergroup' && ct !== 'group') return;
+            const userId = msg.from && msg.from.id;
+            if (!userId) return;
+            if (mongoose.connection.readyState !== 1) return;
+
+            const chatId = msg.chat.id;
+            const group = await tgUpsertGroup(chatId, msg.chat.title);
+
+            let user = await TgUser.findOne({ telegramUserId: userId, groupId: chatId });
+            if (!user) {
+                user = await TgUser.create({ telegramUserId: userId, groupId: chatId, requiredAdds: group.requiredAdds, currentAdds: 0 });
+            }
+
+            if (await tgIsAdmin(chatId, userId)) {
+                tgNotifMap.delete(`${chatId}:${userId}`);
+                return;
+            }
+
+            if (user.currentAdds >= user.requiredAdds) {
+                tgNotifMap.delete(`${chatId}:${userId}`);
+                return;
+            }
+
+            try { await topshiriqBot.deleteMessage(chatId, msg.message_id); } catch (e) {}
+
+            const notifKey = `${chatId}:${userId}`;
+            const remaining = user.requiredAdds - user.currentAdds;
+            const first = (msg.from && msg.from.first_name) || '';
+            const text = user.currentAdds === 0
+                ? `👋 Salom, ${first}!\n\n😔 Afsuski, hozircha guruhda yozishimizga ruxsat yo'q.\n\n📋 <b>Shart:</b> Guruhda yozish uchun <b>${user.requiredAdds} ta a'zo</b> qo'shishingiz kerak.\n\n📊 Sizning holatingiz: <b>0 / ${user.requiredAdds}</b> 🙁\n\n✨ Pastdagi tugmani bosib, qanday qo'shish kerakligini ko'ring. Omad! 🍀`
+                : `👋 Salom, ${first}!\n\n😔 Afsuski, hali ham guruhda yozishga ruxsat yo'q.\n\n📋 <b>Shart:</b> Guruhda yozish uchun <b>${user.requiredAdds} ta a'zo</b> qo'shishingiz kerak.\n\n📊 Sizning holatingiz: <b>${user.currentAdds} / ${user.requiredAdds}</b> 👍\n\n➡️ Yana <b>${remaining} ta a'zo</b> qo'shsangiz, yozishingiz mumkin bo'ladi! 🎯\n\n✨ Pastdagi tugmani bosib, qanday qo'shish kerakligini ko'ring. Sizga omad! 🍀`;
+            const keyboard = { inline_keyboard: [[{ text: "➕ A'zo qo'shish", callback_data: 'member_add_guide' }]] };
+
+            for (let attempt = 0; attempt < 3; attempt++) {
+                try {
+                    const existingMsgId = tgNotifMap.get(notifKey);
+                    if (existingMsgId) {
+                        try {
+                            await topshiriqBot.editMessageText(text, {
+                                chat_id: chatId, message_id: existingMsgId, parse_mode: 'HTML', reply_markup: keyboard
+                            });
+                            tgScheduleDeletion(chatId, existingMsgId, Date.now() + 20000);
+                            return;
+                        } catch (e) { tgNotifMap.delete(notifKey); }
+                    }
+                    const sent = await topshiriqBot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard });
+                    tgNotifMap.set(notifKey, sent.message_id);
+                    const deleteAt = Date.now() + 20000;
+                    try { await TgScheduledDeletion.create({ chatId, messageId: sent.message_id, deleteAt: new Date(deleteAt) }); } catch (e) {}
+                    tgScheduleDeletion(chatId, sent.message_id, deleteAt);
+                    return;
+                } catch (err) {
+                    const rt = tgRetryAfter(err);
+                    if (rt) { await tgSleep(rt * 1000); } else { return; }
+                }
+            }
+        } catch (e) { console.error('Topshiriq msg xato:', e && e.message); }
+    }
+
+    async function tgHandleAdmin(msg) {
+        try {
+            if (!msg || !msg.chat) return;
+            const ct = msg.chat.type;
+            if (ct !== 'supergroup' && ct !== 'group') return;
+            const userId = msg.from && msg.from.id;
+            if (!userId) return;
+
+            let member;
+            try { member = await topshiriqBot.getChatMember(msg.chat.id, userId); } catch (e) { return; }
+            if (member.status !== 'creator' && member.status !== 'administrator') {
+                try { await topshiriqBot.sendMessage(msg.chat.id, '🚫 Faqat guruh adminlari bu buyruqdan foydalana oladi.'); } catch (e) {}
+                return;
+            }
+
+            const group = await tgUpsertGroup(msg.chat.id, msg.chat.title);
+            tgAdminSessions.set(userId, { chatId: msg.chat.id });
+            try {
+                await topshiriqBot.sendMessage(msg.chat.id, tgPanelText(group.requiredAdds), {
+                    parse_mode: 'HTML', reply_markup: tgBuildKeyboard(group.requiredAdds)
+                });
+            } catch (e) {}
+        } catch (e) { console.error('Topshiriq /admin xato:', e && e.message); }
+    }
+
+    topshiriqBot.on('message', (msg) => {
+        (async () => {
+            if (!msg || !msg.chat) return;
+            if (msg.chat.type !== 'supergroup' && msg.chat.type !== 'group') return;
+            if (msg.from && msg.from.is_bot) return;
+            const text = msg.text;
+            if (text && text.startsWith('/admin')) await tgHandleAdmin(msg);
+            else await tgHandleMessage(msg);
+        })().catch(e => console.error('Topshiriq message handler xato:', e && e.message));
+    });
+
+    // --- CHAT_MEMBER (a'zo qo'shildi / chiqdi) ---
+    topshiriqBot.on('chat_member', (update) => {
+        (async () => {
+            try {
+                const chat = update && update.chat;
+                const newMember = update && update.new_chat_member;
+                const newStatus = newMember && newMember.status;
+                const oldStatus = update && update.old_chat_member && update.old_chat_member.status;
+                const newMemberId = newMember && newMember.user && newMember.user.id;
+                const fromId = update && update.from && update.from.id;
+                if (!chat || !newMemberId) return;
+                if (mongoose.connection.readyState !== 1) return;
+
+                const chatId = chat.id;
+                const group = await tgUpsertGroup(chatId, chat.title);
+
+                if (newStatus === 'member' && (oldStatus === 'left' || oldStatus === 'kicked')) {
+                    await tgEnsureUser(newMemberId, chatId, group.requiredAdds);
+                    if (fromId && fromId !== newMemberId) {
+                        await tgEnsureUser(fromId, chatId, group.requiredAdds);
+                        const existingAdded = await TgAddedMember.findOne({ addedUserId: newMemberId, groupId: chatId, adderId: fromId });
+                        if (!existingAdded) {
+                            await TgAddedMember.create({ adderId: fromId, addedUserId: newMemberId, groupId: chatId, status: 'ACTIVE' });
+                            const updatedAdder = await TgUser.findOneAndUpdate(
+                                { telegramUserId: fromId, groupId: chatId },
+                                { $inc: { currentAdds: 1 } },
+                                { new: true }
+                            );
+                            if (updatedAdder && updatedAdder.currentAdds >= updatedAdder.requiredAdds) {
+                                await tgSendReadyMessage(chatId, fromId);
+                            }
+                        }
+                    }
+                }
+
+                if (newStatus === 'left' || newStatus === 'kicked') {
+                    const added = await TgAddedMember.find({ addedUserId: newMemberId, groupId: chatId, status: 'ACTIVE' });
+                    for (const a of added) {
+                        await TgAddedMember.updateOne({ _id: a._id }, { $set: { status: 'LEFT' } });
+                        await TgUser.updateOne({ telegramUserId: a.adderId, groupId: chatId }, { $inc: { currentAdds: -1 } });
+                    }
+                }
+            } catch (e) { console.error('Topshiriq chat_member xato:', e && e.message); }
+        })();
+    });
+
+    // --- CALLBACK (panel + yo'riqnoma) ---
+    topshiriqBot.on('callback_query', (q) => {
+        (async () => {
+            try {
+                const data = q && q.data;
+                const chatId = q && q.message && q.message.chat.id;
+                const userId = q && q.from && q.from.id;
+                if (!chatId || !userId) return;
+
+                if (data === 'member_add_guide') {
+                    try { await topshiriqBot.answerCallbackQuery(q.id, { text: "👌 Yo'riqnoma" }); } catch (e) {}
+                    const sent = await topshiriqBot.sendMessage(chatId, TG_MEMBER_GUIDE, { parse_mode: 'HTML' });
+                    const deleteAt = Date.now() + 20000;
+                    try { await TgScheduledDeletion.create({ chatId, messageId: sent.message_id, deleteAt: new Date(deleteAt) }); } catch (e) {}
+                    tgScheduleDeletion(chatId, sent.message_id, deleteAt);
+                    return;
+                }
+
+                if (data && data.startsWith('admin_')) {
+                    const session = tgAdminSessions.get(userId);
+                    if (!session || session.chatId !== chatId) {
+                        try { await topshiriqBot.answerCallbackQuery(q.id, { text: "🚫 Bu panel boshqa guruh uchun. Yangi /admin bosing." }); } catch (e) {}
+                        return;
+                    }
+                    if (data === 'admin_add_member') {
+                        try { await topshiriqBot.answerCallbackQuery(q.id, { text: "👌 Qo'llanma yuborildi" }); } catch (e) {}
+                        const sent = await topshiriqBot.sendMessage(chatId, TG_ADMIN_GUIDE, { parse_mode: 'HTML' });
+                        const deleteAt = Date.now() + 20000;
+                        try { await TgScheduledDeletion.create({ chatId, messageId: sent.message_id, deleteAt: new Date(deleteAt) }); } catch (e) {}
+                        tgScheduleDeletion(chatId, sent.message_id, deleteAt);
+                        tgAdminSessions.delete(userId);
+                        return;
+                    }
+                    const m = data.match(/^admin_set_(\d+)$/);
+                    if (m) {
+                        const n = parseInt(m[1], 10);
+                        if (TG_OPTIONS.includes(n)) {
+                            await TgGroup.updateOne({ telegramGroupId: chatId }, { $set: { requiredAdds: n } });
+                            await TgUser.updateMany({ groupId: chatId }, { $set: { requiredAdds: n } });
+                            try {
+                                await topshiriqBot.editMessageText(tgPanelText(n), {
+                                    chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML', reply_markup: tgBuildKeyboard(n)
+                                });
+                            } catch (e) {}
+                            try { await topshiriqBot.answerCallbackQuery(q.id, { text: `✅ Kerakli son: ${n} ta qilindi.` }); } catch (e) {}
+                            tgAdminSessions.delete(userId);
+                        }
+                    }
+                }
+            } catch (e) { console.error('Topshiriq callback xato:', e && e.message); }
+        })();
+    });
+
+    // --- ISHGA TUSHIRISH ---
+    (async () => {
+        try {
+            const me = await topshiriqBot.getMe();
+            console.log('TOPSHIRIQ bot ishga tushdi: @' + me.username);
+        } catch (e) { console.error('Topshiriq bot getMe xato:', e && e.message); }
+        setTimeout(tgRecoverDeletions, 3000);
+    })();
+} else {
+    console.log('TOPSHIRIQ_TOKEN yo\'q — topshiriq bot o\'chirilgan (kinobot ishlayapti).');
+}
