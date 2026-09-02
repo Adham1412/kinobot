@@ -4,14 +4,44 @@ const path = require('path');
 const dns = require('dns');
 dns.setServers(['8.8.8.8', '1.1.1.1']);
 const TelegramBot = require('node-telegram-bot-api');
-const mongoose = require('mongoose');
+const { Pool } = require('pg');
 const express = require('express');
 
 // --- SOZLAMALAR ---
 const token = process.env.BOT_TOKEN;
 const adminId = parseInt(process.env.ADMIN_ID);
 const dbChannelId = process.env.DB_CHANNEL_ID;
-const mongoUri = process.env.MONGO_URI;
+
+// --- POSTGRESQL BAZA ---
+const dbUrl = process.env.DATABASE_URL;
+const dbParts = new URL(dbUrl);
+const pool = new Pool({
+    host: dbParts.hostname,
+    port: parseInt(dbParts.port || '5432'),
+    database: dbParts.pathname.replace(/^\//, ''),
+    user: decodeURIComponent(dbParts.username),
+    password: decodeURIComponent(dbParts.password),
+    max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
+});
+const pgConnected = { ok: false };
+pool.on('error', (e) => console.error('PG pool xato:', e.message));
+async function pgQuery(text, params) {
+    return await pool.query(text, params);
+}
+async function waitDB() {
+    try {
+        await pool.query('SELECT 1');
+        pgConnected.ok = true;
+        console.log('PostgreSQL ulandi');
+    } catch (e) {
+        pgConnected.ok = false;
+        console.error('PostgreSQL ulanishda xato:', e.message);
+        setTimeout(waitDB, 5000);
+    }
+}
+const dbReady = () => pgConnected.ok;
 
 // --- YAGONA NUSXA TEKSHIRUVI (ikkita bot bir token bilan ishlamasin) ---
 const lockFile = path.join(__dirname, '.bot.pid');
@@ -46,68 +76,21 @@ async function getBotUsername() {
     return botUsername;
 }
 
-// Baza ulanguncha operatsiyalar kutib qolib, process o'lmasligi uchun
-mongoose.set('bufferCommands', false);
-
 // Hech qanday xato botni o'ldirmasligi uchun himoya
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e && e.message || e));
 process.on('uncaughtException', (e) => console.error('uncaughtException:', e && e.message || e));
 
-// --- MODELLAR ---
-const User = mongoose.model('User', new mongoose.Schema({
-    chatId: { type: Number, unique: true },
-    firstName: String,
-    joinedAt: { type: Date, default: Date.now }
-}));
-
-const Movie = mongoose.model('Movie', new mongoose.Schema({
-    code: { type: String, unique: true },
-    fileId: String,
-    caption: String,
-    views: { type: Number, default: 0 },
-    channelMsgId: Number
-}));
-
-const SponsorChannel = mongoose.model('SponsorChannel', new mongoose.Schema({
-    channelId: String,
-    name: String,
-    link: String
-}));
-
-// Yuborilgan kinolar (obuna tekshiruvi uchun)
-const DeliveredMovie = mongoose.model('DeliveredMovie', new mongoose.Schema({
-    chatId: Number,
-    messageId: Number,
-    movieCode: String,
-    deliveredAt: { type: Date, default: Date.now }
-}));
-
-// --- MONGODB (uzilishda avto-qayta ulanish) ---
-async function connectDB() {
-    try {
-        await mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 15000 });
-        console.log('MongoDB ulandi');
-        updateBotBio();
-        // Aloqa uzilsa — avtomatik qayta ulanish
-        mongoose.connection.on('disconnected', () => {
-            console.log('MongoDB uzildi, qayta ulanmoqda...');
-            setTimeout(connectDB, 5000);
-        });
-    } catch (err) {
-        console.error('MongoDB ulanishda xato:', err.message);
-        setTimeout(connectDB, 10000);
-    }
-}
-connectDB();
+// --- POSTGRESQL ULANISH ---
+waitDB();
 setInterval(updateBotBio, 3600 * 1000);
 
 async function updateBotBio() {
     try {
-        if (mongoose.connection.readyState !== 1) return;
-        const userCount = await User.countDocuments();
-        const movieCount = await Movie.countDocuments();
+        if (!dbReady()) return;
+        const u = await pgQuery('SELECT COUNT(*)::int AS c FROM users');
+        const m = await pgQuery('SELECT COUNT(*)::int AS c FROM movies');
         await bot.setMyShortDescription({
-            short_description: `🎬 Kino kodini yuboring!\n\n👥 ${userCount} | 💿 ${movieCount}`
+            short_description: `🎬 Kino kodini yuboring!\n\n👥 ${u.rows[0].c} | 💿 ${m.rows[0].c}`
         });
     } catch (e) { console.error('Bio xato:', e.message); }
 }
@@ -163,29 +146,26 @@ function buildSubKeyboard(channels) {
 // --- KINO YUBORISH ---
 async function cleanupMovie(movieId) {
     try {
-        const movie = await Movie.findById(movieId);
-        if (movie) await DeliveredMovie.deleteMany({ movieCode: movie.code });
-        await Movie.deleteOne({ _id: movieId });
+        const m = await pgQuery('SELECT code FROM movies WHERE id = $1', [movieId]);
+        if (m.rows[0]) await pgQuery('DELETE FROM delivered_movies WHERE movie_code = $1', [m.rows[0].code]);
+        await pgQuery('DELETE FROM movies WHERE id = $1', [movieId]);
     } catch (e) { console.error(e); }
 }
 
 async function sendMovie(chatId, movieId) {
     try {
-        const upd = await Movie.findOneAndUpdate({ _id: movieId }, { $inc: { views: 1 } }, { returnDocument: 'after' });
+        const updRes = await pgQuery('UPDATE movies SET views = views + 1 WHERE id = $1 RETURNING *', [movieId]);
+        const upd = updRes.rows[0];
         if (!upd) return false;
         const isUser = chatId !== adminId;
-        const sentMsg = await bot.sendVideo(chatId, upd.fileId, {
+        const sentMsg = await bot.sendVideo(chatId, upd.file_id, {
             caption: `🎬 <b>${upd.caption}</b>\n\n👁 Ko'rishlar: ${upd.views}\n🤖 Bot: @${await getBotUsername()}`,
             parse_mode: 'HTML',
             ...(isUser ? { protect_content: true } : {})
         });
         if (isUser) {
             try {
-                await new DeliveredMovie({
-                    chatId,
-                    messageId: sentMsg.message_id,
-                    movieCode: upd.code
-                }).save();
+                await pgQuery('INSERT INTO delivered_movies (chat_id, message_id, movie_code) VALUES ($1,$2,$3)', [chatId, sentMsg.message_id, upd.code]);
             } catch (e) {}
         }
         return true;
@@ -195,14 +175,14 @@ async function sendMovie(chatId, movieId) {
         let deleted = false;
         if (upd) {
             try {
-                await bot.getFile(upd.fileId);
+                await bot.getFile(upd.file_id);
             } catch (e2) {
                 const m = (e2.message || '').toLowerCase();
                 deleted = !m.includes('too big') && !m.includes('flood');
             }
         }
         if (upd && deleted) {
-            await cleanupMovie(upd._id);
+            await cleanupMovie(upd.id);
             bot.sendMessage(chatId, '❌ Bu kod bekor qilingan');
         } else {
             bot.sendMessage(chatId, '❌ Kino uzilmayapti');
@@ -222,8 +202,8 @@ async function finishSubscription(chatId, msgId, queryId) {
     const pend = pendingMovies.get(chatId);
     if (pend) {
         pendingMovies.delete(chatId);
-        const movie = await Movie.findOne({ code: pend.code });
-        if (movie) await sendMovie(chatId, movie._id);
+        const m = await pgQuery('SELECT * FROM movies WHERE code = $1', [pend.code]);
+        if (m.rows[0]) await sendMovie(chatId, m.rows[0].id);
     } else {
         bot.sendMessage(chatId, '✅');
     }
@@ -234,7 +214,7 @@ let refreshing = false;
 async function refreshPendingSubs() {
     if (refreshing) return;
     if (pendingMovies.size === 0) return;
-    if (mongoose.connection.readyState !== 1) return;
+    if (!dbReady()) return;
     refreshing = true;
     try {
         for (const [chatId, pend] of pendingMovies) {
@@ -243,8 +223,8 @@ async function refreshPendingSubs() {
                 // Hammasiga a'zo bo'ldi — kino avto yuboriladi, tugmalar o'chadi
                 if (pendingMovies.get(chatId) === pend) pendingMovies.delete(chatId);
                 try { await bot.deleteMessage(chatId, pend.msgId); } catch (e) {}
-                const movie = await Movie.findOne({ code: pend.code });
-                if (movie) await sendMovie(chatId, movie._id);
+                const m = await pgQuery('SELECT * FROM movies WHERE code = $1', [pend.code]);
+                if (m.rows[0]) await sendMovie(chatId, m.rows[0].id);
             } else {
                 // Yangi holat: chiqib ketgan bo'lsa tugma qaytadi, a'zo bo'lgan bo'lsa yo'qoladi
                 try {
@@ -265,25 +245,26 @@ setInterval(refreshPendingSubs, 5000);
 // --- YUBORILGAN KINOLARNI TEKSHIRISH (OBUNA BUZILSA — KINO O'CHIRILADI, OBUNA TUGMASI QAYTADI) ---
 async function revokeDeliveredForChat(chatId) {
     try {
-        const entries = await DeliveredMovie.find({ chatId });
+        const r = await pgQuery('SELECT * FROM delivered_movies WHERE chat_id = $1', [chatId]);
+        const entries = r.rows;
         if (entries.length === 0) return;
         for (const entry of entries) {
-            try { await bot.deleteMessage(chatId, entry.messageId); } catch (e) {}
+            try { await bot.deleteMessage(chatId, entry.message_id); } catch (e) {}
         }
         const missing = await getMissingChannels(chatId);
         const sent = await bot.sendMessage(chatId, '⚠️ Kanal obunasi buzildi! Kinoni olish uchun quyidagi kanalga obuna bo\'ling:', {
             reply_markup: buildSubKeyboard(missing)
         });
-        const lastCode = entries[entries.length - 1].movieCode;
+        const lastCode = entries[entries.length - 1].movie_code;
         pendingMovies.set(chatId, { code: lastCode, msgId: sent.message_id });
-        await DeliveredMovie.deleteMany({ chatId });
+        await pgQuery('DELETE FROM delivered_movies WHERE chat_id = $1', [chatId]);
     } catch (e) { console.error('Delivered revoke xato:', e && e.message); }
 }
 async function checkAllDelivered() {
-    if (mongoose.connection.readyState !== 1) return;
+    if (!dbReady()) return;
     try {
-        const delivered = await DeliveredMovie.find();
-        const chatIds = [...new Set(delivered.map(d => d.chatId))];
+        const r = await pgQuery('SELECT * FROM delivered_movies');
+        const chatIds = [...new Set(r.rows.map(d => d.chat_id))];
         for (const chatId of chatIds) {
             const missing = await getMissingChannels(chatId);
             if (missing.length > 0) await revokeDeliveredForChat(chatId);
@@ -313,10 +294,11 @@ bot.on('message', (msg) => {
     const video = msg.video;
 
     // Foydalanuvchini saqlash (baza ulanganda)
-    if (mongoose.connection.readyState === 1) {
+    if (dbReady()) {
         try {
-            if (!await User.exists({ chatId })) {
-                await new User({ chatId, firstName: msg.chat.first_name }).save();
+            const exists = await pgQuery('SELECT 1 FROM users WHERE chat_id = $1', [chatId]);
+            if (!exists.rows[0]) {
+                await pgQuery('INSERT INTO users (chat_id, first_name) VALUES ($1,$2)', [chatId, msg.chat.first_name || null]);
             }
         } catch (e) { console.error(e); }
     }
@@ -348,7 +330,8 @@ bot.on('message', (msg) => {
             if (state.step === 'await_code') {
                 if (text) {
                     const code = text.trim();
-                    if (await Movie.findOne({ code })) {
+                    const dup = await pgQuery('SELECT 1 FROM movies WHERE code = $1', [code]);
+                    if (dup.rows[0]) {
                         return bot.sendMessage(chatId, '❌ Kod band. Boshqa kod:', cancelKeyboard);
                     }
                     bot.sendMessage(chatId, '⏳...');
@@ -356,12 +339,10 @@ bot.on('message', (msg) => {
                         const sentMsg = await bot.sendVideo(dbChannelId, state.fileId, {
                             caption: `💿 ${code}\n📄 ${state.caption}\n👁 @${(await getBotUsername())}`
                         });
-                        await new Movie({
-                            code,
-                            fileId: sentMsg.video.file_id,
-                            caption: state.caption,
-                            channelMsgId: sentMsg.message_id
-                        }).save();
+                        await pgQuery(
+                            'INSERT INTO movies (code, file_id, caption, channel_msg_id) VALUES ($1,$2,$3,$4)',
+                            [code, sentMsg.video.file_id, state.caption, sentMsg.message_id]
+                        );
                         adminState.delete(chatId);
                         return bot.sendMessage(chatId, `✅ Qo'shildi. Kod: <code>${code}</code>`, { parse_mode: 'HTML', ...adminKeyboard });
                     } catch (err) {
@@ -374,12 +355,14 @@ bot.on('message', (msg) => {
             if (state.step === 'await_del_code') {
                 if (text) {
                     const code = text.trim();
-                    const movie = await Movie.findOne({ code });
+                    const m = await pgQuery('SELECT * FROM movies WHERE code = $1', [code]);
+                    const movie = m.rows[0];
                     if (!movie) return bot.sendMessage(chatId, '❌ Topilmadi. Kod:', cancelKeyboard);
-                    if (movie.channelMsgId) {
-                        try { await bot.deleteMessage(dbChannelId, movie.channelMsgId); } catch (e) {}
+                    if (movie.channel_msg_id) {
+                        try { await bot.deleteMessage(dbChannelId, movie.channel_msg_id); } catch (e) {}
                     }
-                    await Movie.deleteOne({ _id: movie._id });
+                    await pgQuery('DELETE FROM movies WHERE id = $1', [movie.id]);
+                    await pgQuery('DELETE FROM delivered_movies WHERE movie_code = $1', [code]);
                     adminState.delete(chatId);
                     return bot.sendMessage(chatId, `🗑 O'chirildi: <code>${code}</code>`, { parse_mode: 'HTML', ...adminKeyboard });
                 }
@@ -399,7 +382,7 @@ bot.on('message', (msg) => {
                         adminState.set(chatId, { step: 'add_ch_link', chId: text });
                         return bot.sendMessage(chatId, `Link yuboring (qo'lda):`, cancelKeyboard);
                     }
-                    await new SponsorChannel({ channelId: text, link, name: chat.title }).save();
+                    await pgQuery('INSERT INTO sponsor_channels (channel_id, link, name) VALUES ($1,$2,$3)', [text, link, chat.title]);
                     adminState.delete(chatId);
                     return bot.sendMessage(chatId, `✅ Qo'shildi: <b>${chat.title}</b>`, { parse_mode: 'HTML', ...adminKeyboard });
                 } catch (err) {
@@ -411,18 +394,19 @@ bot.on('message', (msg) => {
                 return bot.sendMessage(chatId, 'Nom:', cancelKeyboard);
             }
             if (state.step === 'add_ch_name') {
-                await new SponsorChannel({ channelId: state.chId, link: state.chLink, name: text }).save();
+                await pgQuery('INSERT INTO sponsor_channels (channel_id, link, name) VALUES ($1,$2,$3)', [state.chId, state.chLink, text]);
                 adminState.delete(chatId);
                 return bot.sendMessage(chatId, '✅ Qo\'shildi!', adminKeyboard);
             }
 
             if (state.step === 'broadcast') {
-                const users = await User.find();
+                const ur = await pgQuery('SELECT chat_id FROM users');
+                const users = ur.rows;
                 bot.sendMessage(chatId, `🚀 ${users.length} ga yuborilmoqda...`);
                 let ok = 0, fail = 0;
                 for (const u of users) {
-                    if (u.chatId < 0) continue;
-                    try { await bot.copyMessage(u.chatId, chatId, msg.message_id); ok++; }
+                    if (u.chat_id < 0) continue;
+                    try { await bot.copyMessage(u.chat_id, chatId, msg.message_id); ok++; }
                     catch (e) { fail++; }
                     await new Promise(r => setTimeout(r, 50));
                 }
@@ -446,11 +430,12 @@ bot.on('message', (msg) => {
                 adminState.set(chatId, { step: 'broadcast' });
                 return bot.sendMessage(chatId, '📢 Xabar yuboring:', cancelKeyboard);
             case '📊 Statistika':
-                const uCount = await User.countDocuments();
-                const mCount = await Movie.countDocuments();
-                return bot.sendMessage(chatId, `👥 ${uCount}\n💿 ${mCount}`, { parse_mode: 'HTML' });
+                const uc = await pgQuery('SELECT COUNT(*)::int AS c FROM users');
+                const mc = await pgQuery('SELECT COUNT(*)::int AS c FROM movies');
+                return bot.sendMessage(chatId, `👥 ${uc.rows[0].c}\n💿 ${mc.rows[0].c}`, { parse_mode: 'HTML' });
             case '📢 Kanallar Sozlamasi':
-                const channels = await SponsorChannel.find();
+    const r = await pgQuery('SELECT * FROM sponsor_channels');
+    const channels = r.rows;
                 let msgText = "Kanallar:\n\n";
                 channels.forEach((ch, i) => msgText += `${i + 1}. <a href="${ch.link}">${ch.name}</a>\n`);
                 return bot.sendMessage(chatId, msgText, {
@@ -471,7 +456,8 @@ bot.on('message', (msg) => {
     }
 
     if (text) {
-        const movie = await Movie.findOne({ code: text });
+        const mr = await pgQuery('SELECT * FROM movies WHERE code = $1', [text]);
+        const movie = mr.rows[0];
         if (!movie) return bot.sendMessage(chatId, '❌ Bunday kod yo\'q');
 
         const missing = await getMissingChannels(chatId);
@@ -484,7 +470,7 @@ bot.on('message', (msg) => {
             pendingMovies.set(chatId, { code: movie.code, msgId: sent.message_id });
             return;
         }
-        await sendMovie(chatId, movie._id);
+        await sendMovie(chatId, movie.id);
     }
     })().catch(e => console.error('Message handler xato:', e && e.message));
 });
@@ -521,8 +507,9 @@ bot.on('callback_query', (query) => {
 
     // Admin: kanal o'chirish
     if (data === 'del_ch' && chatId === adminId) {
-        const channels = await SponsorChannel.find();
-        const kb = channels.map(ch => [{ text: `🗑 ${ch.name}`, callback_data: `delete_${ch._id}` }]);
+        const cr = await pgQuery('SELECT * FROM sponsor_channels');
+        const channels = cr.rows;
+        const kb = channels.map(ch => [{ text: `🗑 ${ch.name}`, callback_data: `delete_${ch.id}` }]);
         kb.push([{ text: '🔙 Bekor', callback_data: 'cancel_del' }]);
         return bot.editMessageText('Tanlang:', {
             chat_id: chatId,
@@ -532,7 +519,7 @@ bot.on('callback_query', (query) => {
     }
 
     if (data.startsWith('delete_') && chatId === adminId) {
-        await SponsorChannel.findByIdAndDelete(data.split('_')[1]);
+        await pgQuery('DELETE FROM sponsor_channels WHERE id = $1', [parseInt(data.split('_')[1], 10)]);
         return bot.sendMessage(chatId, '✅ O\'chirildi.');
     }
 
@@ -552,36 +539,6 @@ if (tgToken) {
         polling: { params: { allowed_updates: ['message', 'callback_query', 'chat_member'] } }
     });
     topshiriqBot.on('polling_error', (e) => console.error('Topshiriq polling:', e && e.message));
-
-    // MODELLAR (MongoDB)
-    const TgGroup = mongoose.model('TgGroup', new mongoose.Schema({
-        telegramGroupId: { type: Number, unique: true },
-        title: String,
-        isActive: { type: Boolean, default: true },
-        requiredAdds: { type: Number, default: 3 }
-    }));
-    const TgUserSchema = new mongoose.Schema({
-        telegramUserId: Number,
-        groupId: Number,
-        currentAdds: { type: Number, default: 0 },
-        requiredAdds: Number
-    });
-    TgUserSchema.index({ telegramUserId: 1, groupId: 1 }, { unique: true });
-    const TgUser = mongoose.model('TgUser', TgUserSchema);
-    const TgAddedMember = mongoose.model('TgAddedMember', new mongoose.Schema({
-        adderId: Number,
-        addedUserId: Number,
-        groupId: Number,
-        status: { type: String, default: 'ACTIVE' }
-    }));
-    const TgScheduledDeletionSchema = new mongoose.Schema({
-        chatId: Number,
-        messageId: Number,
-        deleteAt: Date
-    });
-    TgScheduledDeletionSchema.index({ chatId: 1, messageId: 1 }, { unique: true });
-    TgScheduledDeletionSchema.index({ deleteAt: 1 });
-    const TgScheduledDeletion = mongoose.model('TgScheduledDeletion', TgScheduledDeletionSchema);
 
     // --- YORDAMCHILAR ---
     const tgRetryAfter = (err) => {
@@ -615,7 +572,7 @@ if (tgToken) {
     const tgDeleteTimers = new Map();
     async function tgDoDelete(chatId, messageId) {
         try { await topshiriqBot.deleteMessage(chatId, messageId); } catch (e) {}
-        try { await TgScheduledDeletion.deleteMany({ chatId, messageId }); } catch (e) {}
+        try { await pgQuery('DELETE FROM tg_scheduled_deletions WHERE chat_id = $1 AND message_id = $2', [chatId, messageId]); } catch (e) {}
     }
     function tgScheduleDeletion(chatId, messageId, deleteAtMs) {
         const key = `${chatId}:${messageId}`;
@@ -628,21 +585,21 @@ if (tgToken) {
         tgDeleteTimers.set(key, timer);
     }
     async function tgRecoverDeletions() {
-        if (mongoose.connection.readyState !== 1) return;
+        if (!dbReady()) return;
         try {
             const now = new Date();
-            const expired = await TgScheduledDeletion.find({ deleteAt: { $lte: now } });
-            for (const en of expired) tgDoDelete(en.chatId, en.messageId);
-            const pending = await TgScheduledDeletion.find({ deleteAt: { $gt: now } });
-            for (const en of pending) tgScheduleDeletion(en.chatId, en.messageId, en.deleteAt.getTime());
-            console.log('Topshiriq recovery:', expired.length, 'muddati o\'tgan,', pending.length, 'kutilayotgan');
+            const exp = await pgQuery('SELECT * FROM tg_scheduled_deletions WHERE delete_at <= $1', [now]);
+            for (const en of exp.rows) tgDoDelete(en.chat_id, en.message_id);
+            const pend = await pgQuery('SELECT * FROM tg_scheduled_deletions WHERE delete_at > $1', [now]);
+            for (const en of pend.rows) tgScheduleDeletion(en.chat_id, en.message_id, new Date(en.delete_at).getTime());
+            console.log('Topshiriq recovery:', exp.rows.length, 'muddati o\'tgan,', pend.rows.length, 'kutilayotgan');
         } catch (e) { console.error('Topshiriq recovery xato:', e && e.message); }
     }
     setInterval(async () => {
-        if (mongoose.connection.readyState !== 1) return;
+        if (!dbReady()) return;
         try {
-            const expired = await TgScheduledDeletion.find({ deleteAt: { $lte: new Date() } });
-            for (const en of expired) tgDoDelete(en.chatId, en.messageId);
+            const exp = await pgQuery('SELECT * FROM tg_scheduled_deletions WHERE delete_at <= $1', [new Date()]);
+            for (const en of exp.rows) tgDoDelete(en.chat_id, en.message_id);
         } catch (e) {}
     }, 5000);
 
@@ -672,17 +629,18 @@ if (tgToken) {
     const TG_ADMIN_GUIDE = `📖 <b>A'zo qo'shish yo'riqnomasi</b>\n\n1️⃣ Guruhni oching\n2️⃣ Yuqoridan (sarlavha yonidagi) <b>➕</b> yoki <b>🗣 A'zolar</b> tugmasini bosing\n3️⃣ <b>Add Members</b> ni tanlang\n4️⃣ Kontaktlarni belgilab qo'shing\n\nBajarilgach, a'zolaringiz soni avtomatik hisoblanadi. 🎉`;
 
     async function tgUpsertGroup(chatId, title) {
-        return TgGroup.findOneAndUpdate(
-            { telegramGroupId: chatId },
-            { $set: { title: title || 'Unknown' }, $setOnInsert: { requiredAdds: 3, isActive: true } },
-            { new: true, upsert: true, setDefaultsOnInsert: true }
+        await pgQuery(
+            'INSERT INTO tg_groups (telegram_group_id, title, is_active, required_adds) VALUES ($1,$2,TRUE,3) ON CONFLICT (telegram_group_id) DO UPDATE SET title = $2',
+            [chatId, title || 'Unknown']
         );
+        const r = await pgQuery('SELECT * FROM tg_groups WHERE telegram_group_id = $1', [chatId]);
+        return r.rows[0];
     }
     async function tgEnsureUser(telegramUserId, groupId, requiredAdds) {
-        const existing = await TgUser.findOne({ telegramUserId, groupId });
-        if (!existing) {
-            await TgUser.create({ telegramUserId, groupId, currentAdds: 0, requiredAdds });
-        }
+        await pgQuery(
+            'INSERT INTO tg_users (telegram_user_id, group_id, current_adds, required_adds) VALUES ($1,$2,0,$3) ON CONFLICT (telegram_user_id, group_id) DO NOTHING',
+            [telegramUserId, groupId, requiredAdds]
+        );
     }
     async function tgSendReadyMessage(chatId, userId) {
         try {
@@ -694,7 +652,7 @@ if (tgToken) {
                 { parse_mode: 'HTML' }
             );
             const deleteAt = Date.now() + 20000;
-            try { await TgScheduledDeletion.create({ chatId, messageId: sent.message_id, deleteAt: new Date(deleteAt) }); } catch (e) {}
+            try { await pgQuery('INSERT INTO tg_scheduled_deletions (chat_id, message_id, delete_at) VALUES ($1,$2,$3)', [chatId, sent.message_id, new Date(deleteAt)]); } catch (e) {}
             tgScheduleDeletion(chatId, sent.message_id, deleteAt);
         } catch (e) {
             const rt = tgRetryAfter(e);
@@ -712,22 +670,21 @@ if (tgToken) {
             if (ct !== 'supergroup' && ct !== 'group') return;
             const userId = msg.from && msg.from.id;
             if (!userId) return;
-            if (mongoose.connection.readyState !== 1) return;
+            if (!dbReady()) return;
 
             const chatId = msg.chat.id;
             const group = await tgUpsertGroup(chatId, msg.chat.title);
 
-            let user = await TgUser.findOne({ telegramUserId: userId, groupId: chatId });
-            if (!user) {
-                user = await TgUser.create({ telegramUserId: userId, groupId: chatId, requiredAdds: group.requiredAdds, currentAdds: 0 });
-            }
+            await tgEnsureUser(userId, chatId, group.required_adds);
+            const ur = await pgQuery('SELECT * FROM tg_users WHERE telegram_user_id = $1 AND group_id = $2', [userId, chatId]);
+            let user = ur.rows[0];
 
             if (await tgIsAdmin(chatId, userId)) {
                 tgNotifMap.delete(`${chatId}:${userId}`);
                 return;
             }
 
-            if (user.currentAdds >= user.requiredAdds) {
+            if (user.current_adds >= user.required_adds) {
                 tgNotifMap.delete(`${chatId}:${userId}`);
                 return;
             }
@@ -735,11 +692,11 @@ if (tgToken) {
             try { await topshiriqBot.deleteMessage(chatId, msg.message_id); } catch (e) {}
 
             const notifKey = `${chatId}:${userId}`;
-            const remaining = user.requiredAdds - user.currentAdds;
+            const remaining = user.required_adds - user.current_adds;
             const first = (msg.from && msg.from.first_name) || '';
-            const text = user.currentAdds === 0
-                ? `👋 Salom, ${first}!\n\n😔 Afsuski, hozircha guruhda yozishimizga ruxsat yo'q.\n\n📋 <b>Shart:</b> Guruhda yozish uchun <b>${user.requiredAdds} ta a'zo</b> qo'shishingiz kerak.\n\n📊 Sizning holatingiz: <b>0 / ${user.requiredAdds}</b> 🙁\n\n✨ Pastdagi tugmani bosib, qanday qo'shish kerakligini ko'ring. Omad! 🍀`
-                : `👋 Salom, ${first}!\n\n😔 Afsuski, hali ham guruhda yozishga ruxsat yo'q.\n\n📋 <b>Shart:</b> Guruhda yozish uchun <b>${user.requiredAdds} ta a'zo</b> qo'shishingiz kerak.\n\n📊 Sizning holatingiz: <b>${user.currentAdds} / ${user.requiredAdds}</b> 👍\n\n➡️ Yana <b>${remaining} ta a'zo</b> qo'shsangiz, yozishingiz mumkin bo'ladi! 🎯\n\n✨ Pastdagi tugmani bosib, qanday qo'shish kerakligini ko'ring. Sizga omad! 🍀`;
+            const text = user.current_adds === 0
+                ? `👋 Salom, ${first}!\n\n😔 Afsuski, hozircha guruhda yozishimizga ruxsat yo'q.\n\n📋 <b>Shart:</b> Guruhda yozish uchun <b>${user.required_adds} ta a'zo</b> qo'shishingiz kerak.\n\n📊 Sizning holatingiz: <b>0 / ${user.required_adds}</b> 🙁\n\n✨ Pastdagi tugmani bosib, qanday qo'shish kerakligini ko'ring. Omad! 🍀`
+                : `👋 Salom, ${first}!\n\n😔 Afsuski, hali ham guruhda yozishga ruxsat yo'q.\n\n📋 <b>Shart:</b> Guruhda yozish uchun <b>${user.required_adds} ta a'zo</b> qo'shishingiz kerak.\n\n📊 Sizning holatingiz: <b>${user.current_adds} / ${user.required_adds}</b> 👍\n\n➡️ Yana <b>${remaining} ta a'zo</b> qo'shsangiz, yozishingiz mumkin bo'ladi! 🎯\n\n✨ Pastdagi tugmani bosib, qanday qo'shish kerakligini ko'ring. Sizga omad! 🍀`;
             const keyboard = { inline_keyboard: [[{ text: "➕ A'zo qo'shish", callback_data: 'member_add_guide' }]] };
 
             for (let attempt = 0; attempt < 3; attempt++) {
@@ -757,7 +714,7 @@ if (tgToken) {
                     const sent = await topshiriqBot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard });
                     tgNotifMap.set(notifKey, sent.message_id);
                     const deleteAt = Date.now() + 20000;
-                    try { await TgScheduledDeletion.create({ chatId, messageId: sent.message_id, deleteAt: new Date(deleteAt) }); } catch (e) {}
+                    try { await pgQuery('INSERT INTO tg_scheduled_deletions (chat_id, message_id, delete_at) VALUES ($1,$2,$3)', [chatId, sent.message_id, new Date(deleteAt)]); } catch (e) {}
                     tgScheduleDeletion(chatId, sent.message_id, deleteAt);
                     return;
                 } catch (err) {
@@ -786,8 +743,8 @@ if (tgToken) {
             const group = await tgUpsertGroup(msg.chat.id, msg.chat.title);
             tgAdminSessions.set(userId, { chatId: msg.chat.id });
             try {
-                await topshiriqBot.sendMessage(msg.chat.id, tgPanelText(group.requiredAdds), {
-                    parse_mode: 'HTML', reply_markup: tgBuildKeyboard(group.requiredAdds)
+                await topshiriqBot.sendMessage(msg.chat.id, tgPanelText(group.required_adds), {
+                    parse_mode: 'HTML', reply_markup: tgBuildKeyboard(group.required_adds)
                 });
             } catch (e) {}
         } catch (e) { console.error('Topshiriq /admin xato:', e && e.message); }
@@ -815,24 +772,21 @@ if (tgToken) {
                 const newMemberId = newMember && newMember.user && newMember.user.id;
                 const fromId = update && update.from && update.from.id;
                 if (!chat || !newMemberId) return;
-                if (mongoose.connection.readyState !== 1) return;
+                if (!dbReady()) return;
 
                 const chatId = chat.id;
                 const group = await tgUpsertGroup(chatId, chat.title);
 
                 if (newStatus === 'member' && (oldStatus === 'left' || oldStatus === 'kicked')) {
-                    await tgEnsureUser(newMemberId, chatId, group.requiredAdds);
+                    await tgEnsureUser(newMemberId, chatId, group.required_adds);
                     if (fromId && fromId !== newMemberId) {
-                        await tgEnsureUser(fromId, chatId, group.requiredAdds);
-                        const existingAdded = await TgAddedMember.findOne({ addedUserId: newMemberId, groupId: chatId, adderId: fromId });
-                        if (!existingAdded) {
-                            await TgAddedMember.create({ adderId: fromId, addedUserId: newMemberId, groupId: chatId, status: 'ACTIVE' });
-                            const updatedAdder = await TgUser.findOneAndUpdate(
-                                { telegramUserId: fromId, groupId: chatId },
-                                { $inc: { currentAdds: 1 } },
-                                { new: true }
-                            );
-                            if (updatedAdder && updatedAdder.currentAdds >= updatedAdder.requiredAdds) {
+                        await tgEnsureUser(fromId, chatId, group.required_adds);
+                        const ex = await pgQuery('SELECT 1 FROM tg_added_members WHERE added_user_id = $1 AND group_id = $2 AND adder_id = $3', [newMemberId, chatId, fromId]);
+                        if (!ex.rows[0]) {
+                            await pgQuery('INSERT INTO tg_added_members (adder_id, added_user_id, group_id, status) VALUES ($1,$2,$3,$4)', [fromId, newMemberId, chatId, 'ACTIVE']);
+                            const upd = await pgQuery('UPDATE tg_users SET current_adds = current_adds + 1 WHERE telegram_user_id = $1 AND group_id = $2 RETURNING *', [fromId, chatId]);
+                            const updatedAdder = upd.rows[0];
+                            if (updatedAdder && updatedAdder.current_adds >= updatedAdder.required_adds) {
                                 await tgSendReadyMessage(chatId, fromId);
                             }
                         }
@@ -840,10 +794,10 @@ if (tgToken) {
                 }
 
                 if (newStatus === 'left' || newStatus === 'kicked') {
-                    const added = await TgAddedMember.find({ addedUserId: newMemberId, groupId: chatId, status: 'ACTIVE' });
-                    for (const a of added) {
-                        await TgAddedMember.updateOne({ _id: a._id }, { $set: { status: 'LEFT' } });
-                        await TgUser.updateOne({ telegramUserId: a.adderId, groupId: chatId }, { $inc: { currentAdds: -1 } });
+                    const added = await pgQuery('SELECT * FROM tg_added_members WHERE added_user_id = $1 AND group_id = $2 AND status = $3', [newMemberId, chatId, 'ACTIVE']);
+                    for (const a of added.rows) {
+                        await pgQuery('UPDATE tg_added_members SET status = $1 WHERE id = $2', ['LEFT', a.id]);
+                        await pgQuery('UPDATE tg_users SET current_adds = current_adds - 1 WHERE telegram_user_id = $1 AND group_id = $2', [a.adder_id, chatId]);
                     }
                 }
             } catch (e) { console.error('Topshiriq chat_member xato:', e && e.message); }
@@ -863,7 +817,7 @@ if (tgToken) {
                     try { await topshiriqBot.answerCallbackQuery(q.id, { text: "👌 Yo'riqnoma" }); } catch (e) {}
                     const sent = await topshiriqBot.sendMessage(chatId, TG_MEMBER_GUIDE, { parse_mode: 'HTML' });
                     const deleteAt = Date.now() + 20000;
-                    try { await TgScheduledDeletion.create({ chatId, messageId: sent.message_id, deleteAt: new Date(deleteAt) }); } catch (e) {}
+                    try { await pgQuery('INSERT INTO tg_scheduled_deletions (chat_id, message_id, delete_at) VALUES ($1,$2,$3)', [chatId, sent.message_id, new Date(deleteAt)]); } catch (e) {}
                     tgScheduleDeletion(chatId, sent.message_id, deleteAt);
                     return;
                 }
@@ -878,7 +832,7 @@ if (tgToken) {
                         try { await topshiriqBot.answerCallbackQuery(q.id, { text: "👌 Qo'llanma yuborildi" }); } catch (e) {}
                         const sent = await topshiriqBot.sendMessage(chatId, TG_ADMIN_GUIDE, { parse_mode: 'HTML' });
                         const deleteAt = Date.now() + 20000;
-                        try { await TgScheduledDeletion.create({ chatId, messageId: sent.message_id, deleteAt: new Date(deleteAt) }); } catch (e) {}
+                        try { await pgQuery('INSERT INTO tg_scheduled_deletions (chat_id, message_id, delete_at) VALUES ($1,$2,$3)', [chatId, sent.message_id, new Date(deleteAt)]); } catch (e) {}
                         tgScheduleDeletion(chatId, sent.message_id, deleteAt);
                         tgAdminSessions.delete(userId);
                         return;
@@ -887,8 +841,8 @@ if (tgToken) {
                     if (m) {
                         const n = parseInt(m[1], 10);
                         if (TG_OPTIONS.includes(n)) {
-                            await TgGroup.updateOne({ telegramGroupId: chatId }, { $set: { requiredAdds: n } });
-                            await TgUser.updateMany({ groupId: chatId }, { $set: { requiredAdds: n } });
+                            await pgQuery('UPDATE tg_groups SET required_adds = $1 WHERE telegram_group_id = $2', [n, chatId]);
+                            await pgQuery('UPDATE tg_users SET required_adds = $1 WHERE group_id = $2', [n, chatId]);
                             try {
                                 await topshiriqBot.editMessageText(tgPanelText(n), {
                                     chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML', reply_markup: tgBuildKeyboard(n)

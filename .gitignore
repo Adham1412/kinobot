@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Env / secrets
+.env
+
+# Runtime
+.bot.pid
+*.log
+
+# Test/migration files
+migrate.js
+test_*.js
+
+# OS
+.DS_Store
+Thumbs.db
