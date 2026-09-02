@@ -120,12 +120,13 @@ const cancelKeyboard = {
 // --- OBUNA TEKSHIRUVLARI ---
 async function getMissingChannels(chatId) {
     if (chatId === adminId) return [];
-    const channels = await SponsorChannel.find();
+    const r = await pgQuery('SELECT * FROM sponsor_channels');
+    const channels = r.rows;
     const missing = [];
     for (const ch of channels) {
         let isSub = false;
         try {
-            const m = await bot.getChatMember(ch.channelId, chatId);
+            const m = await bot.getChatMember(ch.channel_id, chatId);
             isSub = !['left', 'kicked'].includes(m.status);
         } catch (e) {
             console.log('Kanal xato:', ch.name, e.message);
@@ -271,7 +272,7 @@ async function checkAllDelivered() {
         }
     } catch (e) { console.error('Check delivered xato:', e && e.message); }
 }
-setInterval(checkAllDelivered, 5 * 60 * 1000);
+setInterval(checkAllDelivered, 20 * 1000);
 
 // --- MESSAGE HANDLER ---
 bot.on('message', (msg) => {
