@@ -173,18 +173,21 @@ async function sendMovie(chatId, movieId) {
     try {
         const upd = await Movie.findOneAndUpdate({ _id: movieId }, { $inc: { views: 1 } }, { returnDocument: 'after' });
         if (!upd) return false;
+        const isUser = chatId !== adminId;
         const sentMsg = await bot.sendVideo(chatId, upd.fileId, {
             caption: `🎬 <b>${upd.caption}</b>\n\n👁 Ko'rishlar: ${upd.views}\n🤖 Bot: @${await getBotUsername()}`,
             parse_mode: 'HTML',
-            protect_content: true
+            ...(isUser ? { protect_content: true } : {})
         });
-        try {
-            await new DeliveredMovie({
-                chatId,
-                messageId: sentMsg.message_id,
-                movieCode: upd.code
-            }).save();
-        } catch (e) {}
+        if (isUser) {
+            try {
+                await new DeliveredMovie({
+                    chatId,
+                    messageId: sentMsg.message_id,
+                    movieCode: upd.code
+                }).save();
+            } catch (e) {}
+        }
         return true;
     } catch (e) {
         // Kino yuborilmadi. Fayl CHINDAKAM o'chirilganligi aniq bo'lsa — bazadan o'chiramiz.
