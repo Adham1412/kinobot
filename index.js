@@ -74,6 +74,14 @@ const SponsorChannel = mongoose.model('SponsorChannel', new mongoose.Schema({
     link: String
 }));
 
+// Yuborilgan kinolar (obuna tekshiruvi uchun)
+const DeliveredMovie = mongoose.model('DeliveredMovie', new mongoose.Schema({
+    chatId: Number,
+    messageId: Number,
+    movieCode: String,
+    deliveredAt: { type: Date, default: Date.now }
+}));
+
 // --- MONGODB (uzilishda avto-qayta ulanish) ---
 async function connectDB() {
     try {
@@ -154,17 +162,29 @@ function buildSubKeyboard(channels) {
 
 // --- KINO YUBORISH ---
 async function cleanupMovie(movieId) {
-    try { await Movie.deleteOne({ _id: movieId }); } catch (e) { console.error(e); }
+    try {
+        const movie = await Movie.findById(movieId);
+        if (movie) await DeliveredMovie.deleteMany({ movieCode: movie.code });
+        await Movie.deleteOne({ _id: movieId });
+    } catch (e) { console.error(e); }
 }
 
 async function sendMovie(chatId, movieId) {
     try {
         const upd = await Movie.findOneAndUpdate({ _id: movieId }, { $inc: { views: 1 } }, { returnDocument: 'after' });
         if (!upd) return false;
-        await bot.sendVideo(chatId, upd.fileId, {
+        const sentMsg = await bot.sendVideo(chatId, upd.fileId, {
             caption: `🎬 <b>${upd.caption}</b>\n\n👁 Ko'rishlar: ${upd.views}\n🤖 Bot: @${await getBotUsername()}`,
-            parse_mode: 'HTML'
+            parse_mode: 'HTML',
+            protect_content: true
         });
+        try {
+            await new DeliveredMovie({
+                chatId,
+                messageId: sentMsg.message_id,
+                movieCode: upd.code
+            }).save();
+        } catch (e) {}
         return true;
     } catch (e) {
         // Kino yuborilmadi. Fayl CHINDAKAM o'chirilganligi aniq bo'lsa — bazadan o'chiramiz.
@@ -238,6 +258,36 @@ async function refreshPendingSubs() {
     }
 }
 setInterval(refreshPendingSubs, 5000);
+
+// --- YUBORILGAN KINOLARNI TEKSHIRISH (OBUNA BUZILSA — KINO O'CHIRILADI, OBUNA TUGMASI QAYTADI) ---
+async function revokeDeliveredForChat(chatId) {
+    try {
+        const entries = await DeliveredMovie.find({ chatId });
+        if (entries.length === 0) return;
+        for (const entry of entries) {
+            try { await bot.deleteMessage(chatId, entry.messageId); } catch (e) {}
+        }
+        const missing = await getMissingChannels(chatId);
+        const sent = await bot.sendMessage(chatId, '⚠️ Kanal obunasi buzildi! Kinoni olish uchun quyidagi kanalga obuna bo\'ling:', {
+            reply_markup: buildSubKeyboard(missing)
+        });
+        const lastCode = entries[entries.length - 1].movieCode;
+        pendingMovies.set(chatId, { code: lastCode, msgId: sent.message_id });
+        await DeliveredMovie.deleteMany({ chatId });
+    } catch (e) { console.error('Delivered revoke xato:', e && e.message); }
+}
+async function checkAllDelivered() {
+    if (mongoose.connection.readyState !== 1) return;
+    try {
+        const delivered = await DeliveredMovie.find();
+        const chatIds = [...new Set(delivered.map(d => d.chatId))];
+        for (const chatId of chatIds) {
+            const missing = await getMissingChannels(chatId);
+            if (missing.length > 0) await revokeDeliveredForChat(chatId);
+        }
+    } catch (e) { console.error('Check delivered xato:', e && e.message); }
+}
+setInterval(checkAllDelivered, 5 * 60 * 1000);
 
 // --- MESSAGE HANDLER ---
 bot.on('message', (msg) => {
