@@ -110,6 +110,19 @@ const adminKeyboard = {
     }
 };
 
+// Yuklashda kontent turini tanlash tugmalari
+const typeKeyboard = {
+    reply_markup: {
+        inline_keyboard: [
+            [{ text: '🎬 Video', callback_data: 'utype_video' }],
+            [{ text: '🔗 Link', callback_data: 'utype_link' }],
+            [{ text: '🖼 Rasm', callback_data: 'utype_photo' }],
+            [{ text: '📄 Hujjat', callback_data: 'utype_document' }],
+            [{ text: '🚫 Bekor', callback_data: 'ucancel' }]
+        ]
+    }
+};
+
 const cancelKeyboard = {
     reply_markup: {
         keyboard: [['🚫 Bekor qilish']],
@@ -159,11 +172,27 @@ async function sendMovie(chatId, movieId) {
         const upd = updRes.rows[0];
         if (!upd) return false;
         const isUser = chatId !== adminId;
-        const sentMsg = await bot.sendVideo(chatId, upd.file_id, {
-            caption: `🎬 <b>${upd.caption}</b>\n\n👁 Ko'rishlar: ${upd.views}\n🤖 Bot: @${await getBotUsername()}`,
-            parse_mode: 'HTML',
-            ...(isUser ? { protect_content: true } : {})
-        });
+        const type = upd.type || 'video';
+        const cap = `🎬 <b>${upd.caption}</b>\n\n👁 Ko'rishlar: ${upd.views}\n🤖 Bot: @${await getBotUsername()}`;
+        const opt = { parse_mode: 'HTML', ...(isUser ? { protect_content: true } : {}) };
+
+        let sentMsg;
+        if (type === 'link') {
+            sentMsg = await bot.sendMessage(chatId, cap, {
+                ...opt,
+                disable_web_page_preview: true,
+                reply_markup: {
+                    inline_keyboard: [[{ text: upd.button_text || 'Batafsil / Ko`rish', url: upd.url }]]
+                }
+            });
+        } else if (type === 'photo') {
+            sentMsg = await bot.sendPhoto(chatId, upd.file_id, { caption: cap, ...opt });
+        } else if (type === 'document') {
+            sentMsg = await bot.sendDocument(chatId, upd.file_id, { caption: cap, ...opt });
+        } else {
+            sentMsg = await bot.sendVideo(chatId, upd.file_id, { caption: cap, ...opt });
+        }
+
         if (isUser) {
             try {
                 await pgQuery('INSERT INTO delivered_movies (chat_id, message_id, movie_code) VALUES ($1,$2,$3)', [chatId, sentMsg.message_id, upd.code]);
@@ -171,10 +200,10 @@ async function sendMovie(chatId, movieId) {
         }
         return true;
     } catch (e) {
-        // Kino yuborilmadi. Fayl CHINDAKAM o'chirilganligi aniq bo'lsa — bazadan o'chiramiz.
+        // Kontent yuborilmadi. Fayl CHINDAKAM o'chirilganligi aniq bo'lsa — bazadan o'chiramiz.
         // Aks holda (katta fayl, flood va h.k.) kino O'CHIRILMAYDI, faqat xato xabar yuboriladi.
         let deleted = false;
-        if (upd) {
+        if (upd && upd.file_id && upd.type !== 'link') {
             try {
                 await bot.getFile(upd.file_id);
             } catch (e2) {
@@ -320,12 +349,48 @@ bot.on('message', (msg) => {
         if (state && isAdminCmd) adminState.delete(chatId);
 
         if (state && !isAdminCmd) {
-            if (state.step === 'await_video') {
-                if (video) {
-                    adminState.set(chatId, { step: 'await_code', fileId: video.file_id, caption: msg.caption || 'Kino' });
-                    return bot.sendMessage(chatId, '✅ Video qabul. <b>Kod</b> yozing:', { parse_mode: 'HTML', ...cancelKeyboard });
+            // KONTENT YUKLASH OQIMI
+            if (state.step === 'await_media') {
+                // video / rasm / hujjat qabul
+                const media = video || msg.photo || (msg.document ? msg.document : null) ||
+                    (msg.audio ? msg.audio : null) || (msg.voice ? msg.voice : null);
+                if (media) {
+                    let fileId = null, caption = (msg.caption || state.caption || 'Kino');
+                    // Photos array holatida oxirgi (eng yuqori sifat) olinadi
+                    if (Array.isArray(msg.photo)) {
+                        fileId = msg.photo[msg.photo.length - 1].file_id;
+                    } else if (video) {
+                        fileId = video.file_id;
+                    } else if (msg.document) {
+                        fileId = msg.document.file_id;
+                    } else if (msg.audio) {
+                        fileId = msg.audio.file_id;
+                    } else if (msg.voice) {
+                        fileId = msg.voice.file_id;
+                    }
+                    adminState.set(chatId, { step: 'await_code', type: state.type, fileId, url: null, buttonText: null, caption });
+                    // Saqlash vaqtida default caption
+                    return bot.sendMessage(chatId, '✅ Qabul. <b>Kod</b> yozing:', { parse_mode: 'HTML', ...cancelKeyboard });
                 }
-                return bot.sendMessage(chatId, '⚠️ Video fayl yuboring:');
+                return bot.sendMessage(chatId, state.type === 'photo' ? '⚠️ Rasm yuboring:' : state.type === 'document' ? '⚠️ Hujjat/fayl yuboring:' : '⚠️ Video fayl yuboring:');
+            }
+
+            if (state.step === 'await_link_url') {
+                if (text) {
+                    let url = text.trim();
+                    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+                    adminState.set(chatId, { step: 'await_link_btn', type: 'link', url, caption: state.caption || 'Link' });
+                    return bot.sendMessage(chatId, '🔗 Tugma <b>nomini</b> yozing (foydalanuvchi ko\'radigan):', { parse_mode: 'HTML', ...cancelKeyboard });
+                }
+                return bot.sendMessage(chatId, '⚠️ Sayt manzili (URL) yuboring:', cancelKeyboard);
+            }
+
+            if (state.step === 'await_link_btn') {
+                if (text) {
+                    adminState.set(chatId, { step: 'await_code', type: 'link', fileId: null, url: state.url, buttonText: text.trim(), caption: state.caption || 'Link' });
+                    return bot.sendMessage(chatId, '✅ Link qabul. <b>Kod</b> yozing:', { parse_mode: 'HTML', ...cancelKeyboard });
+                }
+                return bot.sendMessage(chatId, '⚠️ Tugma nomini yozing:', cancelKeyboard);
             }
 
             if (state.step === 'await_code') {
@@ -335,20 +400,49 @@ bot.on('message', (msg) => {
                     if (dup.rows[0]) {
                         return bot.sendMessage(chatId, '❌ Kod band. Boshqa kod:', cancelKeyboard);
                     }
-                    bot.sendMessage(chatId, '⏳...');
-                    try {
-                        const sentMsg = await bot.sendVideo(dbChannelId, state.fileId, {
-                            caption: `💿 ${code}\n📄 ${state.caption}\n👁 @${(await getBotUsername())}`
-                        });
-                        await pgQuery(
-                            'INSERT INTO movies (code, file_id, caption, channel_msg_id) VALUES ($1,$2,$3,$4)',
-                            [code, sentMsg.video.file_id, state.caption, sentMsg.message_id]
-                        );
-                        adminState.delete(chatId);
-                        return bot.sendMessage(chatId, `✅ Qo'shildi. Kod: <code>${code}</code>`, { parse_mode: 'HTML', ...adminKeyboard });
-                    } catch (err) {
-                        console.error(err);
-                        return bot.sendMessage(chatId, '❌ Bot maxfiy kanalda admin emas yoki ID xato.', cancelKeyboard);
+                    const type = state.type || 'video';
+                    // Link bo'lmasa media kanalga yuklanadi
+                    if (type !== 'link') {
+                        bot.sendMessage(chatId, '⏳...');
+                        try {
+                            let sentMsg;
+                            if (type === 'photo') {
+                                sentMsg = await bot.sendPhoto(dbChannelId, state.fileId, {
+                                    caption: `💿 ${code}\n📄 ${state.caption}\n👁 @${(await getBotUsername())}`
+                                });
+                            } else if (type === 'document') {
+                                sentMsg = await bot.sendDocument(dbChannelId, state.fileId, {
+                                    caption: `💿 ${code}\n📄 ${state.caption}\n👁 @${(await getBotUsername())}`
+                                });
+                            } else {
+                                sentMsg = await bot.sendVideo(dbChannelId, state.fileId, {
+                                    caption: `💿 ${code}\n📄 ${state.caption}\n👁 @${(await getBotUsername())}`
+                                });
+                            }
+                            await pgQuery(
+                                'INSERT INTO movies (code, file_id, caption, channel_msg_id, type, url, button_text) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+                                [code, state.fileId, state.caption, sentMsg.message_id, type, null, null]
+                            );
+                            adminState.delete(chatId);
+                            return bot.sendMessage(chatId, `✅ Qo'shildi. Kod: <code>${code}</code>`, { parse_mode: 'HTML', ...adminKeyboard });
+                        } catch (err) {
+                            console.error(err);
+                            return bot.sendMessage(chatId, '❌ Bot maxfiy kanalda admin emas yoki ID xato.', cancelKeyboard);
+                        }
+                    } else {
+                        // Link — kanalga matn ko'rinishida joylanadi
+                        bot.sendMessage(chatId, '⏳...');
+                        try {
+                            await pgQuery(
+                                'INSERT INTO movies (code, file_id, caption, channel_msg_id, type, url, button_text) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+                                [code, null, state.caption || 'Link', null, type, state.url, state.buttonText]
+                            );
+                            adminState.delete(chatId);
+                            return bot.sendMessage(chatId, `✅ Qo'shildi. Kod: <code>${code}</code> (tugma: "${state.buttonText}")`, { parse_mode: 'HTML', ...adminKeyboard });
+                        } catch (err) {
+                            console.error(err);
+                            return bot.sendMessage(chatId, '❌ Xatolik. Qayta urinib ko\'ring.', cancelKeyboard);
+                        }
                     }
                 }
             }
@@ -422,8 +516,8 @@ bot.on('message', (msg) => {
             case '/panel':
                 return bot.sendMessage(chatId, '👋 Admin panel!', adminKeyboard);
             case '🎬 Kino Yuklash':
-                adminState.set(chatId, { step: 'await_video' });
-                return bot.sendMessage(chatId, '📥 Video fayl yuboring:', cancelKeyboard);
+                adminState.set(chatId, { step: 'await_type' });
+                return bot.sendMessage(chatId, '📥 Nima yuklamoqchisiz?', { ...typeKeyboard });
             case "🗑 Kino O'chirish":
                 adminState.set(chatId, { step: 'await_del_code' });
                 return bot.sendMessage(chatId, '🗑 Kod yozing:', { parse_mode: 'HTML', ...cancelKeyboard });
@@ -498,6 +592,22 @@ bot.on('callback_query', (query) => {
             message_id: query.message.message_id
         });
         return;
+    }
+
+    // Admin: kontent turini tanlash (kino yuklash)
+    if (data === 'ucancel' && chatId === adminId) {
+        adminState.delete(chatId);
+        return bot.sendMessage(chatId, '❌ Bekor qilindi.', adminKeyboard);
+    }
+    if (data && data.startsWith('utype_') && chatId === adminId) {
+        const type = data.replace('utype_', '');
+        if (type === 'link') {
+            adminState.set(chatId, { step: 'await_link_url', type: 'link', caption: null });
+            return bot.sendMessage(chatId, '🔗 Sayt manzili (URL) yuboring:', cancelKeyboard);
+        }
+        adminState.set(chatId, { step: 'await_media', type, caption: null });
+        const tlabel = type === 'photo' ? '🖼 Rasm' : type === 'document' ? '📄 Hujjat' : '🎬 Video';
+        return bot.sendMessage(chatId, `📥 ${tlabel} yuboring (ixtiyoriy sarlavha bilan):`, cancelKeyboard);
     }
 
     // Admin: kanal qo'shish
