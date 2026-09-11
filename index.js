@@ -808,7 +808,7 @@ if (tgToken) {
             const text = user.current_adds === 0
                 ? `👋 Salom, ${first}!\n\n😔 Afsuski, hozircha guruhda yozishimizga ruxsat yo'q.\n\n📋 <b>Shart:</b> Guruhda yozish uchun <b>${user.required_adds} ta a'zo</b> qo'shishingiz kerak.\n\n📊 Sizning holatingiz: <b>0 / ${user.required_adds}</b> 🙁\n\n✨ Pastdagi tugmani bosib, qanday qo'shish kerakligini ko'ring. Omad! 🍀`
                 : `👋 Salom, ${first}!\n\n😔 Afsuski, hali ham guruhda yozishga ruxsat yo'q.\n\n📋 <b>Shart:</b> Guruhda yozish uchun <b>${user.required_adds} ta a'zo</b> qo'shishingiz kerak.\n\n📊 Sizning holatingiz: <b>${user.current_adds} / ${user.required_adds}</b> 👍\n\n➡️ Yana <b>${remaining} ta a'zo</b> qo'shsangiz, yozishingiz mumkin bo'ladi! 🎯\n\n✨ Pastdagi tugmani bosib, qanday qo'shish kerakligini ko'ring. Sizga omad! 🍀`;
-            const keyboard = { inline_keyboard: [[{ text: "➕ A'zo qo'shish", callback_data: 'member_add_guide' }]] };
+            const keyboard = { inline_keyboard: [[{ text: "➕ A'zo qo'shish", callback_data: 'member_add_guide' }], [{ text: "🚫 A'zolarni qo'shish kerak emas", callback_data: 'member_no_add' }]] };
 
             for (let attempt = 0; attempt < 3; attempt++) {
                 try {
@@ -933,6 +933,21 @@ if (tgToken) {
                     return;
                 }
 
+                if (data === 'member_no_add') {
+                    await pgQuery('UPDATE tg_users SET required_adds = 0 WHERE telegram_user_id = $1 AND group_id = $2', [userId, chatId]);
+                    tgNotifMap.delete(`${chatId}:${userId}`);
+                    try { await topshiriqBot.answerCallbackQuery(q.id, { text: "✅ Ozod etildingiz!" }); } catch (e) {}
+                    try {
+                        await topshiriqBot.editMessageText("✅ Siz a'zo qo'shish talabidan ozod etildingiz.\n✍️ Endi guruhda <b>bemalol yozishingiz</b> mumkin.", {
+                            chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML'
+                        });
+                        const deleteAt = Date.now() + 20000;
+                        try { await pgQuery('INSERT INTO tg_scheduled_deletions (chat_id, message_id, delete_at) VALUES ($1,$2,$3)', [chatId, q.message.message_id, new Date(deleteAt)]); } catch (e) {}
+                        tgScheduleDeletion(chatId, q.message.message_id, deleteAt);
+                    } catch (e) {}
+                    return;
+                }
+
                 if (data && data.startsWith('admin_')) {
                     const session = tgAdminSessions.get(userId);
                     if (!session || session.chatId !== chatId) {
@@ -953,7 +968,7 @@ if (tgToken) {
                         const n = parseInt(m[1], 10);
                         if (TG_OPTIONS.includes(n)) {
                             await pgQuery('UPDATE tg_groups SET required_adds = $1 WHERE telegram_group_id = $2', [n, chatId]);
-                            await pgQuery('UPDATE tg_users SET required_adds = $1 WHERE group_id = $2', [n, chatId]);
+                            await pgQuery('UPDATE tg_users SET required_adds = $1 WHERE group_id = $2 AND required_adds > 0', [n, chatId]);
                             try {
                                 await topshiriqBot.editMessageText(tgPanelText(n), {
                                     chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML', reply_markup: tgBuildKeyboard(n)
