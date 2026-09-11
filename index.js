@@ -721,7 +721,7 @@ if (tgToken) {
     // --- `/admin` PANELI ---
     const TG_OPTIONS = [1, 2, 3, 5, 10];
     const tgAdminSessions = new Map();
-    function tgBuildKeyboard(requiredAdds) {
+    function tgBuildKeyboard(requiredAdds, requireAdds) {
         const rows = [];
         rows.push([{ text: "➕ A'zo qo'shish", callback_data: 'admin_add_member' }]);
         let row = [];
@@ -731,10 +731,12 @@ if (tgToken) {
             if (i % 2 === 1) { rows.push(row); row = []; }
         }
         if (row.length) rows.push(row);
+        rows.push([{ text: requireAdds ? "⏸ Majburiy qo'shishni o'chirish" : "▶️ Majburiy qo'shishni yoqish", callback_data: 'admin_toggle_req' }]);
         return { inline_keyboard: rows };
     }
-    function tgPanelText(n) {
-        return `🔧 <b>Admin Panel</b>\n\n📌 Hozirgi kerakli son: <b>${n}</b> ta a'zo\n\n👉 Pastdagi tugmalardan tanlang:`;
+    function tgPanelText(n, requireAdds) {
+        const state = requireAdds ? '🟢 YOQILGAN' : '🔴 O\'CHIRILGAN';
+        return `🔧 <b>Admin Panel</b>\n\n📌 Hozirgi kerakli son: <b>${n}</b> ta a'zo\n🎯 Majburiy talab: <b>${state}</b>\n\n👉 Pastdagi tugmalardan tanlang:`;
     }
     const TG_MEMBER_GUIDE = `📖 <b>A'zo qo'shish yo'riqnomasi</b>\n\n1️⃣ Guruhni oching\n2️⃣ Yuqoridagi <b>▾ sarlavha</b> yoki guruh nomi yonidagi belgini bosing\n3️⃣ <b>Add Members</b> yoki <b>➕</b> tugmasini tanlang\n4️⃣ Kontaktlaringizni belgilab <b>qo'shish</b> tugmasini bosing\n\nBajarilgach hisobingiz avtomatik yangilanadi. 🎉\n\n⚠️ <i>Siz qo'shgan a'zo guruhdan chiqib ketsa, sizning hisobingizdan ayriladi.</i>`;
     const TG_ADMIN_GUIDE = `📖 <b>A'zo qo'shish yo'riqnomasi</b>\n\n1️⃣ Guruhni oching\n2️⃣ Yuqoridan (sarlavha yonidagi) <b>➕</b> yoki <b>🗣 A'zolar</b> tugmasini bosing\n3️⃣ <b>Add Members</b> ni tanlang\n4️⃣ Kontaktlarni belgilab qo'shing\n\nBajarilgach, a'zolaringiz soni avtomatik hisoblanadi. 🎉`;
@@ -785,6 +787,7 @@ if (tgToken) {
 
             const chatId = msg.chat.id;
             const group = await tgUpsertGroup(chatId, msg.chat.title);
+            if (!group.require_adds) return;
 
             await tgEnsureUser(userId, chatId, group.required_adds);
             const ur = await pgQuery('SELECT * FROM tg_users WHERE telegram_user_id = $1 AND group_id = $2', [userId, chatId]);
@@ -808,7 +811,7 @@ if (tgToken) {
             const text = user.current_adds === 0
                 ? `👋 Salom, ${first}!\n\n😔 Afsuski, hozircha guruhda yozishimizga ruxsat yo'q.\n\n📋 <b>Shart:</b> Guruhda yozish uchun <b>${user.required_adds} ta a'zo</b> qo'shishingiz kerak.\n\n📊 Sizning holatingiz: <b>0 / ${user.required_adds}</b> 🙁\n\n✨ Pastdagi tugmani bosib, qanday qo'shish kerakligini ko'ring. Omad! 🍀`
                 : `👋 Salom, ${first}!\n\n😔 Afsuski, hali ham guruhda yozishga ruxsat yo'q.\n\n📋 <b>Shart:</b> Guruhda yozish uchun <b>${user.required_adds} ta a'zo</b> qo'shishingiz kerak.\n\n📊 Sizning holatingiz: <b>${user.current_adds} / ${user.required_adds}</b> 👍\n\n➡️ Yana <b>${remaining} ta a'zo</b> qo'shsangiz, yozishingiz mumkin bo'ladi! 🎯\n\n✨ Pastdagi tugmani bosib, qanday qo'shish kerakligini ko'ring. Sizga omad! 🍀`;
-            const keyboard = { inline_keyboard: [[{ text: "➕ A'zo qo'shish", callback_data: 'member_add_guide' }], [{ text: "🚫 A'zolarni qo'shish kerak emas", callback_data: 'member_no_add' }]] };
+            const keyboard = { inline_keyboard: [[{ text: "➕ A'zo qo'shish", callback_data: 'member_add_guide' }]] };
 
             for (let attempt = 0; attempt < 3; attempt++) {
                 try {
@@ -854,8 +857,8 @@ if (tgToken) {
             const group = await tgUpsertGroup(msg.chat.id, msg.chat.title);
             tgAdminSessions.set(userId, { chatId: msg.chat.id });
             try {
-                await topshiriqBot.sendMessage(msg.chat.id, tgPanelText(group.required_adds), {
-                    parse_mode: 'HTML', reply_markup: tgBuildKeyboard(group.required_adds)
+                await topshiriqBot.sendMessage(msg.chat.id, tgPanelText(group.required_adds, group.require_adds), {
+                    parse_mode: 'HTML', reply_markup: tgBuildKeyboard(group.required_adds, group.require_adds)
                 });
             } catch (e) {}
         } catch (e) { console.error('Topshiriq /admin xato:', e && e.message); }
@@ -887,6 +890,7 @@ if (tgToken) {
 
                 const chatId = chat.id;
                 const group = await tgUpsertGroup(chatId, chat.title);
+                if (!group.require_adds) return;
 
                 if (newStatus === 'member' && (oldStatus === 'left' || oldStatus === 'kicked')) {
                     await tgEnsureUser(newMemberId, chatId, group.required_adds);
@@ -933,21 +937,6 @@ if (tgToken) {
                     return;
                 }
 
-                if (data === 'member_no_add') {
-                    await pgQuery('UPDATE tg_users SET required_adds = 0 WHERE telegram_user_id = $1 AND group_id = $2', [userId, chatId]);
-                    tgNotifMap.delete(`${chatId}:${userId}`);
-                    try { await topshiriqBot.answerCallbackQuery(q.id, { text: "✅ Ozod etildingiz!" }); } catch (e) {}
-                    try {
-                        await topshiriqBot.editMessageText("✅ Siz a'zo qo'shish talabidan ozod etildingiz.\n✍️ Endi guruhda <b>bemalol yozishingiz</b> mumkin.", {
-                            chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML'
-                        });
-                        const deleteAt = Date.now() + 20000;
-                        try { await pgQuery('INSERT INTO tg_scheduled_deletions (chat_id, message_id, delete_at) VALUES ($1,$2,$3)', [chatId, q.message.message_id, new Date(deleteAt)]); } catch (e) {}
-                        tgScheduleDeletion(chatId, q.message.message_id, deleteAt);
-                    } catch (e) {}
-                    return;
-                }
-
                 if (data && data.startsWith('admin_')) {
                     const session = tgAdminSessions.get(userId);
                     if (!session || session.chatId !== chatId) {
@@ -963,15 +952,30 @@ if (tgToken) {
                         tgAdminSessions.delete(userId);
                         return;
                     }
+                    if (data === 'admin_toggle_req') {
+                        await pgQuery('UPDATE tg_groups SET require_adds = NOT require_adds WHERE telegram_group_id = $1', [chatId]);
+                        const gr = await pgQuery('SELECT * FROM tg_groups WHERE telegram_group_id = $1', [chatId]);
+                        const grp = gr.rows[0];
+                        try {
+                            await topshiriqBot.editMessageText(tgPanelText(grp.required_adds, grp.require_adds), {
+                                chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML', reply_markup: tgBuildKeyboard(grp.required_adds, grp.require_adds)
+                            });
+                        } catch (e) {}
+                        try { await topshiriqBot.answerCallbackQuery(q.id, { text: grp.require_adds ? "✅ Majburiy talab YOQILDI" : "✅ Majburiy talab O'CHIRILDI" }); } catch (e) {}
+                        tgAdminSessions.delete(userId);
+                        return;
+                    }
                     const m = data.match(/^admin_set_(\d+)$/);
                     if (m) {
                         const n = parseInt(m[1], 10);
                         if (TG_OPTIONS.includes(n)) {
                             await pgQuery('UPDATE tg_groups SET required_adds = $1 WHERE telegram_group_id = $2', [n, chatId]);
-                            await pgQuery('UPDATE tg_users SET required_adds = $1 WHERE group_id = $2 AND required_adds > 0', [n, chatId]);
+                            await pgQuery('UPDATE tg_users SET required_adds = $1 WHERE group_id = $2', [n, chatId]);
+                            const g2 = await pgQuery('SELECT * FROM tg_groups WHERE telegram_group_id = $1', [chatId]);
+                            const grp = g2.rows[0];
                             try {
-                                await topshiriqBot.editMessageText(tgPanelText(n), {
-                                    chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML', reply_markup: tgBuildKeyboard(n)
+                                await topshiriqBot.editMessageText(tgPanelText(n, grp.require_adds), {
+                                    chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML', reply_markup: tgBuildKeyboard(n, grp.require_adds)
                                 });
                             } catch (e) {}
                             try { await topshiriqBot.answerCallbackQuery(q.id, { text: `✅ Kerakli son: ${n} ta qilindi.` }); } catch (e) {}
