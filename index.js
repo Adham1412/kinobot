@@ -4,6 +4,8 @@ const path = require('path');
 const dns = require('dns');
 dns.setServers(['8.8.8.8', '1.1.1.1']);
 dns.setDefaultResultOrder('ipv4first');
+const https = require('https');
+const botTlsAgent = new https.Agent({ family: 4, keepAlive: true });
 const TelegramBot = require('node-telegram-bot-api');
 const { Pool } = require('pg');
 const express = require('express');
@@ -68,7 +70,7 @@ app.get('/', (req, res) => res.send('Bot faol va ishlamoqda!'));
 app.listen(process.env.PORT || 3000, () => console.log('Server ishladi'));
 
 // --- BOT ---
-const bot = new TelegramBot(token, { polling: true });
+const bot = new TelegramBot(token, { polling: true, request: { agent: botTlsAgent } });
 let botUsername = null;
 async function getBotUsername() {
     if (!botUsername) {
@@ -648,7 +650,8 @@ const tgToken = process.env.TOPSHIRIQ_TOKEN;
 
 if (tgToken) {
     const topshiriqBot = new TelegramBot(tgToken, {
-        polling: { params: { allowed_updates: ['message', 'callback_query', 'chat_member'] } }
+        polling: { params: { allowed_updates: ['message', 'callback_query', 'chat_member'] } },
+        request: { agent: botTlsAgent }
     });
     topshiriqBot.on('polling_error', (e) => console.error('Topshiriq polling:', e && e.message));
 
