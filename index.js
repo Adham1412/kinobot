@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const dns = require('dns');
 dns.setServers(['8.8.8.8', '1.1.1.1']);
+dns.setDefaultResultOrder('ipv4first');
 const TelegramBot = require('node-telegram-bot-api');
 const { Pool } = require('pg');
 const express = require('express');
