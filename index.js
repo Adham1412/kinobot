@@ -9,6 +9,7 @@ const botTlsAgent = new https.Agent({ family: 4, keepAlive: true });
 const TelegramBot = require('node-telegram-bot-api');
 const { Pool } = require('pg');
 const express = require('express');
+const analytics = require('./analytics');
 
 // --- SOZLAMALAR ---
 const token = process.env.BOT_TOKEN;
@@ -78,6 +79,10 @@ async function getBotUsername() {
     }
     return botUsername;
 }
+
+// --- ANALYTICS (statistika tizimi) ---
+analytics.init(bot, pgQuery, adminId);
+analytics.startDailyReport();
 
 // Hech qanday xato botni o'ldirmasligi uchun himoya
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e && e.message || e));
@@ -200,6 +205,7 @@ async function sendMovie(chatId, movieId) {
             try {
                 await pgQuery('INSERT INTO delivered_movies (chat_id, message_id, movie_code) VALUES ($1,$2,$3)', [chatId, sentMsg.message_id, upd.code]);
             } catch (e) {}
+            analytics.trackEvent('download', chatId, { movie_code: upd.code });
         }
         return true;
     } catch (e) {
@@ -218,6 +224,7 @@ async function sendMovie(chatId, movieId) {
             await cleanupMovie(upd.id);
             bot.sendMessage(chatId, '❌ Bu kod bekor qilingan');
         } else {
+            analytics.trackBlocked(chatId, e);
             bot.sendMessage(chatId, '❌ Kino uzilmayapti');
         }
         return false;
@@ -282,7 +289,7 @@ async function revokeDeliveredForChat(chatId) {
         const entries = r.rows;
         if (entries.length === 0) return;
         for (const entry of entries) {
-            try { await bot.deleteMessage(chatId, entry.message_id); } catch (e) {}
+            try { await bot.deleteMessage(chatId, entry.message_id); } catch (e) { if (e) analytics.trackBlocked(chatId, e); }
         }
         const missing = await getMissingChannels(chatId);
         const sent = await bot.sendMessage(chatId, '⚠️ Kanal obunasi buzildi! Kinoni olish uchun quyidagi kanalga obuna bo\'ling:', {
@@ -291,7 +298,10 @@ async function revokeDeliveredForChat(chatId) {
         const lastCode = entries[entries.length - 1].movie_code;
         pendingMovies.set(chatId, { code: lastCode, msgId: sent.message_id });
         await pgQuery('DELETE FROM delivered_movies WHERE chat_id = $1', [chatId]);
-    } catch (e) { console.error('Delivered revoke xato:', e && e.message); }
+    } catch (e) {
+        analytics.trackBlocked(chatId, e);
+        console.error('Delivered revoke xato:', e && e.message);
+    }
 }
 async function checkAllDelivered() {
     if (!dbReady()) return;
@@ -505,7 +515,7 @@ bot.on('message', (msg) => {
                 for (const u of users) {
                     if (u.chat_id < 0) continue;
                     try { await bot.copyMessage(u.chat_id, chatId, msg.message_id); ok++; }
-                    catch (e) { fail++; }
+                    catch (e) { analytics.trackBlocked(u.chat_id, e); fail++; }
                     await new Promise(r => setTimeout(r, 50));
                 }
                 adminState.delete(chatId);
@@ -517,6 +527,7 @@ bot.on('message', (msg) => {
         switch (text) {
             case '/start':
             case '/panel':
+                analytics.trackEvent('start', chatId);
                 return bot.sendMessage(chatId, '👋 Admin panel!', adminKeyboard);
             case '🎬 Kino Yuklash':
                 adminState.set(chatId, { step: 'await_type' });
@@ -528,9 +539,8 @@ bot.on('message', (msg) => {
                 adminState.set(chatId, { step: 'broadcast' });
                 return bot.sendMessage(chatId, '📢 Xabar yuboring:', cancelKeyboard);
             case '📊 Statistika':
-                const uc = await pgQuery('SELECT COUNT(*)::int AS c FROM users');
-                const mc = await pgQuery('SELECT COUNT(*)::int AS c FROM movies');
-                return bot.sendMessage(chatId, `👥 ${uc.rows[0].c}\n💿 ${mc.rows[0].c}`, { parse_mode: 'HTML' });
+                if (!dbReady()) return bot.sendMessage(chatId, '⏳ Baza ulanmoqda...');
+                return analytics.openStats(chatId);
             case '📢 Kanallar Sozlamasi':
     const r = await pgQuery('SELECT * FROM sponsor_channels');
     const channels = r.rows;
@@ -550,13 +560,19 @@ bot.on('message', (msg) => {
 
     // --- USER ---
     if (text === '/start') {
+        analytics.trackEvent('start', chatId);
         return bot.sendMessage(chatId, '👋 Kino kodini yuboring:');
     }
 
     if (text) {
         const mr = await pgQuery('SELECT * FROM movies WHERE code = $1', [text]);
         const movie = mr.rows[0];
-        if (!movie) return bot.sendMessage(chatId, '❌ Bunday kod yo\'q');
+        if (!movie) {
+            if (!text.startsWith('/') && text.length <= 60) {
+                analytics.trackEvent('not_found', chatId, { movie_code: text, payload: text });
+            }
+            return bot.sendMessage(chatId, '❌ Bunday kod yo\'q');
+        }
 
         const missing = await getMissingChannels(chatId);
         if (missing.length > 0) {
@@ -581,6 +597,12 @@ bot.on('callback_query', (query) => {
 
     // Admin har qanday tugma bossa — kutilayotgan matn holati bekor, tugma o'z vazifasini bajaradi
     if (chatId === adminId) adminState.delete(chatId);
+
+    // Statistika menyusi tugmalari
+    if (data && data.startsWith('st_') && chatId === adminId) {
+        await analytics.handleStatsCallback(data, chatId, query);
+        return;
+    }
 
     // ✅ Tekshirish — hammasini tekshiradi
     if (data === 'check_sub') {
